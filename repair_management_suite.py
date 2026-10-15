@@ -11,6 +11,7 @@ Source:  https://github.com/tylersword12/RMS
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
+import hashlib
 import os
 import sys
 import re
@@ -38,7 +39,7 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
@@ -263,13 +264,62 @@ def record_stamp(machine):
     return str(machine.get('updated_at') or machine.get('created_at') or '')
 
 
+def legacy_record_id(machine):
+    """Stable id for a job saved before record_id existed.
+
+    Derived from the estimate number, so the shared copy, this computer's
+    copy, and every other computer all give the same old job the same id.
+    A random id here made one job look like two and triggered renumbering.
+    """
+    num = str(machine.get('estimate_number', '') or '').strip()
+    if not num:
+        return None
+    return 'L' + hashlib.sha1(num.encode('utf-8')).hexdigest()[:11]
+
+
+def adopt_record_ids(target, reference):
+    """Give id-less records in `target` the id their twin in `reference`
+    already has (matched by estimate number).
+
+    Covers a computer still holding pre-id data after another computer has
+    already assigned ids and saved them to the share.
+    """
+    ref = {}
+    for m in reference or []:
+        num = str(m.get('estimate_number', '') or '').strip()
+        rid = m.get('record_id')
+        if num and rid:
+            ref.setdefault(num, []).append(str(rid))
+    used = {str(m.get('record_id')) for m in target or [] if m.get('record_id')}
+    adopted = 0
+    for m in target or []:
+        if m.get('record_id'):
+            continue
+        num = str(m.get('estimate_number', '') or '').strip()
+        for rid in ref.get(num, []):
+            if rid not in used:
+                m['record_id'] = rid
+                used.add(rid)
+                adopted += 1
+                break
+    return adopted
+
+
 def ensure_record_ids(machines):
-    """Give any record without one a record_id and a created_at."""
+    """Give any record without one a record_id and a created_at.
+
+    Pass active and shipped together (a + b) so ids are unique across both.
+    """
     changed = 0
     now = datetime.now().isoformat()
+    used = {str(m.get('record_id')) for m in machines if m.get('record_id')}
     for m in machines:
         if not m.get('record_id'):
-            m['record_id'] = new_record_id()
+            rid = legacy_record_id(m)
+            if not rid or rid in used:
+                rid = new_record_id()
+            m['record_id'] = rid
+            used.add(rid)
             changed += 1
         if not m.get('created_at'):
             # Best guess for an existing record, so merges have something to sort on
@@ -367,41 +417,135 @@ def merge_machine_data(server_active, server_shipped,
     return active, shipped, stats
 
 
-def resolve_estimate_collisions(active, shipped):
-    """Two computers offline on the same day can mint the same estimate
-    number. Keep the one created first; renumber the later one to the next
-    free slot. Returns a list of (record, old_number, new_number).
-    """
-    everything = list(active or []) + list(shipped or [])
-    taken = set()
-    by_number = {}
-    for m in everything:
-        by_number.setdefault(str(m.get('estimate_number', '')), []).append(m)
-        taken.add(str(m.get('estimate_number', '')))
+# Fields that identify a physical job. If these all match, two records are
+# almost certainly the same job entered (or synced) twice.
+JOB_IDENTITY_FIELDS = ('customer_name', 'serial_number', 'make', 'model', 'arrival_date')
 
-    renames = []
-    for number, group in by_number.items():
-        if len(group) < 2 or not number or '-' not in number:
-            continue
-        # Oldest record keeps the number
-        group.sort(key=lambda m: (str(m.get('created_at') or ''), record_key(m)))
-        prefix = number.rsplit('-', 1)[0]
-        for dup in group[1:]:
-            n = 1
-            while True:
-                candidate = f"{prefix}-{str(n).zfill(3)}"
-                if candidate not in taken:
-                    break
-                n += 1
-                if n > 999:
-                    candidate = f"{prefix}-{record_key(dup)[:3]}"
-                    break
-            old = str(dup.get('estimate_number', ''))
-            dup['estimate_number'] = candidate
-            dup['renumbered_from'] = old
-            taken.add(candidate)
-            renames.append((dup, old, candidate))
-    return renames
+
+def _norm_field(value):
+    return ' '.join(str(value or '').split()).lower()
+
+
+def same_job(a, b):
+    return all(_norm_field(a.get(f)) == _norm_field(b.get(f))
+               for f in JOB_IDENTITY_FIELDS)
+
+
+def find_estimate_conflicts(active, shipped):
+    """Find estimate numbers that need a decision. Changes nothing.
+
+    Two kinds:
+      'shared'     - two or more jobs currently hold the same number.
+      'renumbered' - an earlier version renumbered a job automatically
+                     (it carries 'renumbered_from') and the job that kept
+                     the original number is still here.
+
+    Returns a list of {'number', 'kind', 'members': [(record, 'Active'|
+    'Shipped')], 'identical'} sorted by number.
+    """
+    lists = (('Active', active or []), ('Shipped', shipped or []))
+    by_number = {}
+    for where, lst in lists:
+        for m in lst:
+            num = str(m.get('estimate_number', '') or '').strip()
+            if num:
+                by_number.setdefault(num, []).append((m, where))
+
+    groups = {}
+    for num, members in by_number.items():
+        if len(members) > 1:
+            groups[num] = {'number': num, 'kind': 'shared', 'members': list(members)}
+
+    for where, lst in lists:
+        for m in lst:
+            old = str(m.get('renumbered_from', '') or '').strip()
+            num = str(m.get('estimate_number', '') or '').strip()
+            if not old or old == num or old not in by_number:
+                continue
+            g = groups.get(old)
+            if g is None:
+                g = groups[old] = {'number': old, 'kind': 'renumbered',
+                                   'members': list(by_number[old])}
+            if not any(x is m for x, _ in g['members']):
+                g['members'].append((m, where))
+
+    out = []
+    for num in sorted(groups):
+        g = groups[num]
+        recs = [m for m, _ in g['members']]
+        g['identical'] = all(same_job(recs[0], r) for r in recs[1:])
+        out.append(g)
+    return out
+
+
+def conflict_signature(conflict):
+    """Identifies a conflict so 'decide later' isn't re-asked every save."""
+    return (conflict['number'],
+            frozenset(record_key(m) for m, _ in conflict['members']))
+
+
+def _current_records(active, shipped, conflict):
+    """The live records for a conflict's members, looked up by id, since an
+    autosave can swap in fresh record objects after the conflict was found."""
+    keys = [record_key(m) for m, _ in conflict['members']]
+    live = {record_key(m): m for m in list(active) + list(shipped)}
+    seen, out = set(), []
+    for k in keys:
+        if k in live and k not in seen:
+            out.append(live[k])
+            seen.add(k)
+    return out
+
+
+def merge_conflict(active, shipped, conflict):
+    """The user said these are the same job: keep one, drop the copies.
+
+    The most recently edited record is kept and takes the group's estimate
+    number. Lists are modified in place.
+    Returns (kept, removed_list, other_numbers) or None if nothing to do.
+    """
+    number = conflict['number']
+    recs = _current_records(active, shipped, conflict)
+    if len(recs) < 2:
+        return None
+    other_numbers = {str(m.get('estimate_number', '') or '') for m in recs} - {number, ''}
+    keep = max(recs, key=lambda m: (record_stamp(m),
+                                    str(m.get('estimate_number', '')) == number))
+    removed = [m for m in recs if m is not keep]
+    gone = {id(m) for m in removed}
+    active[:] = [m for m in active if id(m) not in gone]
+    shipped[:] = [m for m in shipped if id(m) not in gone]
+    keep['estimate_number'] = number
+    keep.pop('renumbered_from', None)
+    return keep, removed, other_numbers
+
+
+def renumber_conflict(active, shipped, conflict):
+    """The user said these are different jobs.
+
+    For jobs that share a number, the one created first keeps it and the
+    others get the next free number. Jobs an earlier version already
+    renumbered keep the numbers they have. Lists are modified in place.
+    Returns [(record, old_number, new_number)].
+    """
+    number = conflict['number']
+    recs = _current_records(active, shipped, conflict)
+    taken = {str(m.get('estimate_number', '') or '') for m in list(active) + list(shipped)}
+    holders = [m for m in recs if str(m.get('estimate_number', '')) == number]
+    holders.sort(key=lambda m: (str(m.get('created_at') or ''), record_key(m)))
+    prefix = number.rsplit('-', 1)[0] if '-' in number else number
+    changes = []
+    for dup in holders[1:]:
+        n = 1
+        while f"{prefix}-{n:03d}" in taken:
+            n += 1
+        new_num = f"{prefix}-{n:03d}"
+        dup['estimate_number'] = new_num
+        taken.add(new_num)
+        changes.append((dup, number, new_num))
+    for m in recs:
+        m.pop('renumbered_from', None)
+    return changes
 
 
 class MachineRepairApp:
@@ -456,7 +600,10 @@ class MachineRepairApp:
         # Sync state
         self._synced_ids = set()
         self._record_snapshot = {}
-        self._pending_renames = []
+        self._pending_conflicts = []
+        self._conflicts_deferred = set()
+        self._conflict_prompt_open = False
+        self._conflict_prompt_scheduled = False
         self._last_merge_stats = {}
         
         # Auto-update state
@@ -701,8 +848,7 @@ class MachineRepairApp:
         computers saving within the same 30-second window cannot wipe out
         each other's jobs.
         """
-        ensure_record_ids(self.active_machines)
-        ensure_record_ids(self.shipped_machines)
+        ensure_record_ids(self.active_machines + self.shipped_machines)
         self._stamp_changed_records()
 
         if not hasattr(self, '_synced_ids'):
@@ -734,14 +880,16 @@ class MachineRepairApp:
             if existing:
                 ex_active = existing.get('active_machines', []) or []
                 ex_shipped = existing.get('shipped_machines', []) or []
-                for lst in (ex_active, ex_shipped):
-                    ensure_record_ids(lst)
+                ex_all = ex_active + ex_shipped
+                adopt_record_ids(ex_all, self.active_machines + self.shipped_machines)
+                ensure_record_ids(ex_all)
                 merged_a, merged_s, _stats = merge_machine_data(
                     ex_active, ex_shipped,
                     self.active_machines, self.shipped_machines,
                     self._synced_ids)
-                resolve_estimate_collisions(merged_a, merged_s)
                 self.active_machines, self.shipped_machines = merged_a, merged_s
+                # Never renumber here - just ask, if the merge produced a clash
+                self._schedule_conflict_prompt()
 
             data = {
                 'active_machines': self.active_machines,
@@ -891,9 +1039,15 @@ class MachineRepairApp:
         server_reachable = self.is_server_reachable()
         have_server_file = os.path.exists(self.save_location)
 
-        # Give every record a stable id before anything is matched up
-        for lst in (server_active, server_shipped, local_active, local_shipped):
-            ensure_record_ids(lst)
+        # Give every record a stable id before anything is matched up.
+        # Old jobs get an id derived from their estimate number (the same on
+        # both copies), or adopt the id the other copy already gave them.
+        server_all = server_active + server_shipped
+        local_all = local_active + local_shipped
+        adopt_record_ids(local_all, server_all)
+        adopt_record_ids(server_all, local_all)
+        ensure_record_ids(server_all)
+        ensure_record_ids(local_all)
 
         if not have_server_file and not server_reachable:
             # Offline with no server copy to compare against: trust local
@@ -916,25 +1070,35 @@ class MachineRepairApp:
             if not server_reachable:
                 self._was_offline = True
 
-        ensure_record_ids(self.active_machines)
-        ensure_record_ids(self.shipped_machines)
+        ensure_record_ids(self.active_machines + self.shipped_machines)
 
-        # Two computers offline on the same day can mint the same number
-        renames = resolve_estimate_collisions(self.active_machines, self.shipped_machines)
-        if renames:
-            self._pending_renames = renames
-            for rec, old, new_num in renames:
-                print(f"Estimate collision: {old} -> {new_num} "
-                      f"({rec.get('customer_name', '')})")
-                self._rename_service_order_files(old, new_num, rec.get('record_id'))
+        # Shared estimate numbers are NOT fixed here. They are listed and the
+        # user decides what to do once the window is up (report_sync_results).
+        self._pending_conflicts = find_estimate_conflicts(
+            self.active_machines, self.shipped_machines)
+        for c in self._pending_conflicts:
+            print(f"Estimate number needs a decision: {c['number']} "
+                  f"({len(c['members'])} jobs, {c['kind']})")
 
         # Records created before Field/Shop tracking existed default to Shop
         self._migrate_service_location()
+
+        # Remember what each record looks like now, so the first save only
+        # timestamps records that were actually edited. Stamping everything
+        # on the first save made this computer's copy win every merge.
+        self._seed_record_snapshot()
+
+    def _seed_record_snapshot(self):
+        self._record_snapshot = {}
+        for m in list(self.active_machines) + list(self.shipped_machines):
+            try:
+                body = json.dumps({k: v for k, v in m.items()
+                                   if k != 'updated_at'}, sort_keys=True, default=str)
+            except Exception:
+                body = str(m)
+            self._record_snapshot[record_key(m)] = body
     
-    def _rename_service_order_files(self, old_number, new_number, record_id):
-        """Follow a renumbered job's service order files to the new name."""
-        if not old_number or not new_number:
-            return
+    def _service_order_dirs(self):
         dirs = []
         if self.service_orders_dir:
             dirs.append(self.service_orders_dir)
@@ -942,17 +1106,46 @@ class MachineRepairApp:
             dirs.append(get_offline_service_orders_dir())
         except Exception:
             pass
-        for d in dirs:
+        return dirs
+
+    @staticmethod
+    def _service_order_owner(path):
+        """record_id inside a service order file: '' if it has none, None if
+        the file can't be read."""
+        try:
+            with open(path, 'r') as f:
+                return str(json.load(f).get('record_id', '') or '')
+        except Exception:
+            return None
+
+    @staticmethod
+    def _set_aside(path, suffix):
+        """Rename a file out of the way instead of deleting it."""
+        dst = path + suffix
+        if os.path.exists(dst):
+            dst = f"{path}{suffix}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        os.replace(path, dst)
+        return dst
+
+    def _rename_service_order_files(self, old_number, new_number, record_id):
+        """Follow a renumbered job's service order files to the new name.
+
+        Only moves a file that names this job's record_id. A file with no
+        record_id stays with the number it was filed under - moving those
+        is what took service orders away from the jobs they belonged to.
+        """
+        if not old_number or not new_number or not record_id:
+            return
+        for d in self._service_order_dirs():
             try:
                 src = os.path.join(d, f"{old_number}_service_order.json")
                 if not os.path.exists(src):
                     continue
-                # Only move the file if it really is this record's
                 try:
                     with open(src, 'r') as f:
                         blob = json.load(f)
                     owner = str(blob.get('record_id', '') or '')
-                    if owner and record_id and owner != str(record_id):
+                    if owner != str(record_id):
                         continue
                     blob['linked_estimate'] = new_number
                     if record_id:
@@ -964,7 +1157,7 @@ class MachineRepairApp:
                     continue
                 with open(dst, 'w') as f:
                     json.dump(blob, f, indent=2)
-                os.replace(src, src + ".renamed")
+                self._set_aside(src, ".renamed")
                 print(f"Service order {old_number} -> {new_number} in {d}")
             except Exception as e:
                 print(f"Could not rename service order {old_number}: {e}")
@@ -972,7 +1165,6 @@ class MachineRepairApp:
     def report_sync_results(self):
         """Tell the user plainly when a merge recovered or renumbered work."""
         stats = getattr(self, '_last_merge_stats', {}) or {}
-        renames = getattr(self, '_pending_renames', []) or []
 
         recovered = stats.get('kept_offline', 0)
         if recovered and self.status_label:
@@ -980,20 +1172,335 @@ class MachineRepairApp:
                 text=f"✅ {recovered} job(s) saved offline were restored and uploaded",
                 fg='#27ae60')
 
-        if renames:
-            lines = "\n".join(
-                f"   {old}  ->  {new}   ({rec.get('customer_name', '')})"
-                for rec, old, new in renames[:10])
-            messagebox.showwarning(
-                "Duplicate Estimate Numbers Resolved",
-                f"{len(renames)} job(s) had an estimate number that was already "
-                "in use - this happens when two computers create jobs while "
-                "offline on the same day.\n\n"
-                "The job created first kept its number. The other was given the "
-                "next free one:\n\n"
-                f"{lines}\n\n"
-                "Their service orders were renamed to match.")
-            self._pending_renames = []
+        conflicts = getattr(self, '_pending_conflicts', []) or []
+        self._pending_conflicts = []
+        if conflicts:
+            self.prompt_estimate_conflicts(conflicts)
+
+    # ------------------------------------------------------------
+    #  Duplicate estimate numbers - always ask, never auto-fix
+    # ------------------------------------------------------------
+
+    def _schedule_conflict_prompt(self):
+        """Called after a save merges in another computer's data. Shows the
+        prompt shortly afterwards (never in the middle of a save)."""
+        if self._conflict_prompt_open or self._conflict_prompt_scheduled:
+            return
+        pending = [c for c in find_estimate_conflicts(self.active_machines,
+                                                      self.shipped_machines)
+                   if conflict_signature(c) not in self._conflicts_deferred]
+        if not pending or not getattr(self, 'status_label', None):
+            return
+        self._conflict_prompt_scheduled = True
+
+        def show():
+            self._conflict_prompt_scheduled = False
+            try:
+                if self.root.winfo_exists():
+                    self.prompt_estimate_conflicts()
+            except Exception as e:
+                print(f"Could not show duplicate-number prompt: {e}")
+        try:
+            self.root.after(500, show)
+        except Exception:
+            self._conflict_prompt_scheduled = False
+
+    def prompt_estimate_conflicts(self, conflicts=None):
+        """List jobs that share an estimate number and let the user decide.
+        Nothing is renumbered or removed without a choice made here."""
+        if self._conflict_prompt_open:
+            return
+        if conflicts is None:
+            conflicts = find_estimate_conflicts(self.active_machines, self.shipped_machines)
+        conflicts = [c for c in conflicts
+                     if conflict_signature(c) not in self._conflicts_deferred]
+        if not conflicts:
+            return
+        self._conflict_prompt_open = True
+        try:
+            choices = self._ask_conflict_actions(conflicts)
+        finally:
+            self._conflict_prompt_open = False
+
+        if choices is None:
+            choices = [(c, 'later') for c in conflicts]
+        self._apply_conflict_actions(choices)
+
+    def _ask_conflict_actions(self, conflicts):
+        """Modal window: one decision per estimate number.
+        Returns [(conflict, 'merge'|'separate'|'later')] or None if closed."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Duplicate Estimate Numbers")
+        dlg.configure(bg='#2c3e50')
+        dlg.geometry("940x640")
+        dlg.minsize(700, 420)
+        dlg.transient(self.root)
+
+        tk.Label(dlg, text=f"{len(conflicts)} estimate number(s) need your decision",
+                 font=('Arial', 15, 'bold'), fg='white', bg='#2c3e50'
+                 ).pack(anchor='w', padx=16, pady=(14, 2))
+        tk.Label(dlg, justify='left', wraplength=900, fg='#bdc3c7', bg='#2c3e50',
+                 font=('Arial', 10),
+                 text=("These jobs share an estimate number, or were renumbered "
+                       "automatically by an earlier version ([auto-copy]). Nothing "
+                       "has been changed. Choose what should happen to each one, then "
+                       "click Apply. 'Decide later' leaves it exactly as it is "
+                       "and asks again next time the program starts.")
+                 ).pack(anchor='w', padx=16, pady=(0, 8))
+
+        # Set-all row
+        bar = tk.Frame(dlg, bg='#2c3e50')
+        bar.pack(fill='x', padx=16, pady=(0, 6))
+        tk.Label(bar, text="Set all to:", fg='#ecf0f1', bg='#2c3e50',
+                 font=('Arial', 10, 'bold')).pack(side='left')
+
+        # Scrollable list of groups
+        holder = tk.Frame(dlg, bg='#2c3e50')
+        holder.pack(fill='both', expand=True, padx=16)
+        canvas = tk.Canvas(holder, bg='#2c3e50', highlightthickness=0)
+        sb = ttk.Scrollbar(holder, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg='#2c3e50')
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(win_id, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+
+        def on_wheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), 'units')
+            elif getattr(event, 'num', None) == 4:
+                canvas.yview_scroll(-1, 'units')
+            elif getattr(event, 'num', None) == 5:
+                canvas.yview_scroll(1, 'units')
+        dlg.bind_all('<MouseWheel>', on_wheel)
+        dlg.bind_all('<Button-4>', on_wheel)
+        dlg.bind_all('<Button-5>', on_wheel)
+
+        rows = []
+        for c in conflicts:
+            identical = c['identical']
+            box = tk.Frame(inner, bg='#34495e', padx=12, pady=8)
+            box.pack(fill='x', pady=5)
+
+            head = tk.Frame(box, bg='#34495e')
+            head.pack(fill='x')
+            tk.Label(head, text=f"Estimate {c['number']}", font=('Arial', 12, 'bold'),
+                     fg='white', bg='#34495e').pack(side='left')
+            count = len(c['members'])
+            verdict = (f"Details match - looks like the same job entered {count} times"
+                       if identical else "Details differ - looks like different jobs")
+            tk.Label(head, text=verdict, font=('Arial', 10, 'bold'),
+                     fg='#2ecc71' if identical else '#f39c12',
+                     bg='#34495e').pack(side='left', padx=12)
+
+            for m, where in c['members']:
+                make_model = f"{m.get('make', '')} {m.get('model', '')}".strip() or '-'
+                tag = "  [auto-copy]" if m.get('renumbered_from') else ""
+                line = (f"{m.get('estimate_number', '')}{tag}  ·  "
+                        f"{m.get('customer_name', '') or '-'}  ·  "
+                        f"S/N {m.get('serial_number', '') or '-'}  ·  "
+                        f"{make_model}  ·  in {m.get('arrival_date', '') or '-'}  ·  "
+                        f"{where}")
+                tk.Label(box, text=line, font=('Consolas', 9), fg='#ecf0f1',
+                         bg='#34495e', anchor='w', justify='left', wraplength=840
+                         ).pack(fill='x', padx=(8, 0))
+
+            extra = count - 1
+            copies = "copy" if extra == 1 else f"{extra} copies"
+            if c['kind'] == 'renumbered':
+                separate_text = ("Different jobs - keep " + ("both" if count == 2 else "all")
+                                 + " with the numbers they have now")
+            else:
+                separate_text = "Different jobs - give the newer one(s) the next free number"
+            options = [
+                ('merge', f"Same job - keep one, remove the extra {copies} "
+                          "(service order goes back under this number)"),
+                ('separate', separate_text),
+                ('later', "Decide later - change nothing"),
+            ]
+            var = tk.StringVar(value='merge' if identical else 'later')
+            for key, text in options:
+                tk.Radiobutton(box, text=text, value=key, variable=var,
+                               fg='#ecf0f1', bg='#34495e', selectcolor='#2c3e50',
+                               activebackground='#34495e', activeforeground='white',
+                               font=('Arial', 10), anchor='w', bd=0,
+                               highlightthickness=0
+                               ).pack(fill='x', padx=(8, 0), pady=1)
+            rows.append((c, var))
+
+        def set_all(key):
+            for _, var in rows:
+                var.set(key)
+
+        def set_suggested():
+            for c, var in rows:
+                var.set('merge' if c['identical'] else 'later')
+
+        for text, cmd in (("Suggested", set_suggested),
+                          ("Same job", lambda: set_all('merge')),
+                          ("Different jobs", lambda: set_all('separate')),
+                          ("Decide later", lambda: set_all('later'))):
+            tk.Button(bar, text=text, command=cmd, bg='#7f8c8d', fg='white',
+                      font=('Arial', 9)).pack(side='left', padx=4)
+
+        result = {'value': None}
+
+        def close():
+            try:
+                dlg.unbind_all('<MouseWheel>')
+                dlg.unbind_all('<Button-4>')
+                dlg.unbind_all('<Button-5>')
+            except Exception:
+                pass
+            dlg.destroy()
+
+        def apply():
+            result['value'] = [(c, var.get()) for c, var in rows]
+            close()
+
+        foot = tk.Frame(dlg, bg='#2c3e50')
+        foot.pack(fill='x', padx=16, pady=12)
+        tk.Button(foot, text="Apply", command=apply, bg='#27ae60', fg='white',
+                  font=('Arial', 12, 'bold'), width=14).pack(side='right')
+        tk.Button(foot, text="Decide Later (change nothing)", command=close,
+                  bg='#7f8c8d', fg='white', font=('Arial', 11)
+                  ).pack(side='right', padx=8)
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        dlg.update_idletasks()
+        x = max(0, (dlg.winfo_screenwidth() // 2) - (dlg.winfo_width() // 2))
+        y = max(0, (dlg.winfo_screenheight() // 2) - (dlg.winfo_height() // 2))
+        dlg.geometry(f"+{x}+{y}")
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        dlg.focus_set()
+        dlg.wait_window()
+        return result['value']
+
+    def _apply_conflict_actions(self, choices):
+        """Carry out what the user picked in the duplicate-number window."""
+        merged, separated, deferred = [], [], 0
+        for c, action in choices:
+            try:
+                if action == 'merge':
+                    res = merge_conflict(self.active_machines, self.shipped_machines, c)
+                    if res:
+                        keep, removed, other_numbers = res
+                        self._merge_service_order_files(c['number'], keep, removed,
+                                                        other_numbers)
+                        merged.append((c['number'], keep, len(removed)))
+                elif action == 'separate':
+                    for rec, old, new in renumber_conflict(
+                            self.active_machines, self.shipped_machines, c):
+                        self._rename_service_order_files(old, new, rec.get('record_id'))
+                        separated.append((rec, old, new))
+                    if c['kind'] == 'renumbered':
+                        separated.append((None, c['number'], None))
+                else:
+                    self._conflicts_deferred.add(conflict_signature(c))
+                    deferred += 1
+            except Exception as e:
+                print(f"Could not apply decision for {c.get('number')}: {e}")
+
+        if not merged and not separated:
+            if deferred and self.status_label:
+                self.status_label.config(
+                    text=f"⚠ {deferred} duplicate estimate number(s) left as they are "
+                         "- you'll be asked again next start",
+                    fg='#e67e22')
+            return
+
+        self.save_data()
+        try:
+            self.refresh_tables()
+            self.update_estimate_display()
+        except Exception as e:
+            print(f"Refresh after duplicate fix failed: {e}")
+
+        parts = []
+        if merged:
+            n = sum(k for _, _, k in merged)
+            parts.append(f"Removed {n} extra cop{'y' if n == 1 else 'ies'} across "
+                         f"{len(merged)} estimate number(s).")
+        renumbered = [(r, o, n) for r, o, n in separated if r is not None]
+        kept_both = sum(1 for r, _, _ in separated if r is None)
+        if renumbered:
+            lines = "\n".join(f"   {o}  ->  {n}   ({r.get('customer_name', '')})"
+                              for r, o, n in renumbered[:10])
+            more = f"\n   ...and {len(renumbered) - 10} more" if len(renumbered) > 10 else ""
+            parts.append(f"Renumbered {len(renumbered)} job(s):\n{lines}{more}")
+        if kept_both:
+            parts.append(f"Kept {kept_both} group(s) as separate jobs with their current numbers.")
+        if deferred:
+            parts.append(f"Left {deferred} for later.")
+        messagebox.showinfo("Duplicate Estimate Numbers", "\n\n".join(parts))
+
+    def _merge_service_order_files(self, number, keep, removed, other_numbers):
+        """Bring a merged job's service order back under its estimate number.
+
+        An earlier version moved a job's service order to the copy's new
+        number and left the original as '<number>_service_order.json.renamed'.
+        The most recently saved of those becomes the job's service order
+        again. The rest are set aside with a '.duplicate' suffix, never
+        deleted.
+        """
+        group_ids = {str(m.get('record_id') or '') for m in [keep] + list(removed)} - {''}
+        keep_id = str(keep.get('record_id') or '')
+        for d in self._service_order_dirs():
+            try:
+                target = os.path.join(d, f"{number}_service_order.json")
+                paths = [target, target + '.renamed'] + [
+                    os.path.join(d, f"{n}_service_order.json") for n in sorted(other_numbers)]
+                candidates = []
+                for p in paths:
+                    if not os.path.exists(p):
+                        continue
+                    owner = self._service_order_owner(p)
+                    if owner is None:
+                        continue                      # unreadable - leave it alone
+                    if owner and owner not in group_ids:
+                        continue                      # another job's paperwork
+                    candidates.append(p)
+                if not candidates:
+                    continue
+                if candidates == [target]:
+                    owner = self._service_order_owner(target)
+                    if not owner or owner == keep_id:
+                        continue                      # already correct
+
+                def saved_key(p):
+                    try:
+                        mtime = os.path.getmtime(p)
+                    except Exception:
+                        mtime = 0
+                    return (read_service_order_stamp(p), mtime)
+                newest = max(candidates, key=saved_key)
+
+                with open(newest, 'r') as f:
+                    blob = json.load(f)
+                blob['linked_estimate'] = number
+                if keep_id:
+                    blob['record_id'] = keep_id
+
+                if os.path.exists(target) and newest != target:
+                    self._set_aside(target, '.before-merge')
+                tmp = target + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(blob, f, indent=2)
+                os.replace(tmp, target)
+                for p in candidates:
+                    if p != target and os.path.exists(p):
+                        self._set_aside(p, '.duplicate')
+                print(f"Service order for {number} restored from "
+                      f"{os.path.basename(newest)} in {d}")
+            except Exception as e:
+                print(f"Could not merge service order files for {number}: {e}")
 
     def _migrate_service_location(self):
         """Give older records a Field/Shop value so filters behave predictably."""
@@ -1008,7 +1515,9 @@ class MachineRepairApp:
     
     def schedule_auto_save(self):
         """Schedule the next auto-save"""
-        self.save_data()
+        # Hold off while the duplicate-number window is waiting on the user
+        if not self._conflict_prompt_open:
+            self.save_data()
         self.root.after(self.auto_save_interval, self.schedule_auto_save)
     
     def create_widgets(self):

@@ -3,7 +3,7 @@
 Windows desktop app for tracking machine repairs, service orders and customer
 sign-off, built for field and shop technicians.
 
-**Current version: 1.3.1**
+**Current version: 1.3.2**
 
 ## What it does
 
