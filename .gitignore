@@ -1,0 +1,25 @@
+# Build output
+build/
+dist/
+*.spec
+build_venv/
+
+# Local app data - never commit these
+repair_settings.json
+repair_data.json
+local_backup.json
+Service_Orders/
+Machine_Attachments/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

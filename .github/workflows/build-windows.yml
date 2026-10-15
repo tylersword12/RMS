@@ -1,0 +1,163 @@
+name: Build Windows EXE
+
+# Builds only on a deliberate version tag, so an in-progress commit can
+# never reach the field. Can also be run manually from the Actions tab to
+# test a build without publishing a release.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Verify APP_VERSION matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          APP=$(python -c "import re;print(re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"',open('repair_management_suite.py',encoding='utf-8').read()).group(1))")
+          echo "tag=$TAG  APP_VERSION=$APP"
+          if [ "$TAG" != "$APP" ]; then
+            echo "::error::Tag v$TAG does not match APP_VERSION $APP in repair_management_suite.py."
+            echo "::error::Bump APP_VERSION and re-tag, or the update check will not see this build as newer."
+            exit 1
+          fi
+
+      - name: Confirm every import resolves
+        run: |
+          python -c "import openpyxl; print('openpyxl ok')"
+          python -c "from reportlab.pdfgen import canvas; print('reportlab ok')"
+          python -c "import barcode; from barcode.writer import ImageWriter; print('python-barcode ok')"
+          python -c "from brother_ql.conversion import convert; print('brother_ql ok')"
+          python -c "import usb.core; print('pyusb ok')"
+          python -c "import cv2; print('opencv ok')"
+          python -c "from pyzbar import pyzbar; print('pyzbar ok')"
+          python -c "import xlrd; print('xlrd ok')"
+          python -c "import win32com.client; print('pywin32 ok')"
+
+      - name: Build the EXE
+        shell: cmd
+        run: |
+          pyinstaller --onefile --noconsole --name "RepairManagementSuite" ^
+            --hidden-import=brother_ql ^
+            --hidden-import=brother_ql.conversion ^
+            --hidden-import=brother_ql.backends ^
+            --hidden-import=brother_ql.backends.helpers ^
+            --hidden-import=brother_ql.backends.pyusb ^
+            --hidden-import=brother_ql.raster ^
+            --hidden-import=brother_ql.devicedependent ^
+            --hidden-import=brother_ql.models ^
+            --hidden-import=brother_ql.labels ^
+            --hidden-import=PIL ^
+            --hidden-import=PIL.Image ^
+            --hidden-import=PIL.ImageDraw ^
+            --hidden-import=PIL.ImageFont ^
+            --hidden-import=PIL._imaging ^
+            --hidden-import=barcode ^
+            --hidden-import=barcode.codex ^
+            --hidden-import=barcode.code128 ^
+            --hidden-import=barcode.writer ^
+            --hidden-import=barcode.base ^
+            --hidden-import=barcode.charsets ^
+            --hidden-import=barcode.charsets.code128 ^
+            --hidden-import=usb ^
+            --hidden-import=usb.core ^
+            --hidden-import=usb.util ^
+            --hidden-import=usb.backend ^
+            --hidden-import=usb.backend.libusb1 ^
+            --hidden-import=usb.backend.libusb0 ^
+            --hidden-import=usb.backend.openusb ^
+            --hidden-import=openpyxl ^
+            --hidden-import=reportlab ^
+            --hidden-import=reportlab.pdfgen ^
+            --hidden-import=reportlab.pdfgen.canvas ^
+            --hidden-import=reportlab.lib ^
+            --hidden-import=reportlab.lib.pagesizes ^
+            --hidden-import=reportlab.lib.colors ^
+            --hidden-import=reportlab.lib.units ^
+            --hidden-import=reportlab.platypus ^
+            --hidden-import=xlrd ^
+            --hidden-import=cv2 ^
+            --hidden-import=pyzbar ^
+            --hidden-import=pyzbar.pyzbar ^
+            --hidden-import=libusb_package ^
+            --hidden-import=usb1 ^
+            --hidden-import=win32com ^
+            --hidden-import=win32com.client ^
+            --hidden-import=pythoncom ^
+            --hidden-import=pywintypes ^
+            --hidden-import=win32api ^
+            --collect-all=brother_ql ^
+            --collect-all=barcode ^
+            --collect-all=usb ^
+            --collect-all=reportlab ^
+            --collect-all=libusb_package ^
+            --collect-all=usb1 ^
+            --collect-all=cv2 ^
+            --collect-all=pyzbar ^
+            --collect-all=win32com ^
+            --collect-submodules=brother_ql ^
+            --collect-submodules=barcode ^
+            --collect-submodules=usb ^
+            --collect-submodules=PIL ^
+            --collect-submodules=reportlab ^
+            --collect-submodules=xlrd ^
+            --collect-data=brother_ql ^
+            --collect-data=barcode ^
+            --collect-data=reportlab ^
+            repair_management_suite.py
+
+      - name: Confirm the EXE was produced
+        shell: bash
+        run: |
+          test -f dist/RepairManagementSuite.exe || { echo "::error::EXE missing"; exit 1; }
+          ls -lh dist/RepairManagementSuite.exe
+
+      - name: Name the EXE after the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cp dist/RepairManagementSuite.exe "dist/RepairManagementSuite_${TAG#v}.exe"
+          ls -lh dist/
+
+      # Keep the build even for a manual run with no tag, so it can be
+      # downloaded and tested before tagging.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RepairManagementSuite-exe
+          path: dist/RepairManagementSuite.exe
+          retention-days: 30
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/RepairManagementSuite.exe
+            dist/RepairManagementSuite_*.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false
