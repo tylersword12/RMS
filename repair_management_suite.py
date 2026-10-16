@@ -41,7 +41,7 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
@@ -589,6 +589,155 @@ def renumber_conflict(active, shipped, conflict):
     for m in recs:
         m.pop('renumbered_from', None)
     return changes
+
+
+def rank_name_matches(typed, names_with_counts, limit=8):
+    """Past names matching what's been typed, best first.
+
+    Names starting with the text come first, then names with a word that
+    starts with it ('farm' -> 'Miller Farms'), then any other match.
+    Within each group, customers with more jobs rank higher.
+    names_with_counts: {display_name: job_count}
+    """
+    t = ' '.join(str(typed or '').split()).lower()
+    if not t:
+        return []
+    scored = []
+    for name, count in names_with_counts.items():
+        low = name.lower()
+        if low == t:
+            continue                      # already typed in full
+        if low.startswith(t):
+            tier = 0
+        elif any(w.startswith(t) for w in low.replace('-', ' ').replace('/', ' ').split()):
+            tier = 1
+        elif t in low:
+            tier = 2
+        else:
+            continue
+        scored.append((tier, -count, low, name))
+    scored.sort()
+    return [s[3] for s in scored[:limit]]
+
+
+class NameAutocomplete:
+    """Drop-down suggestions under an Entry, from a list of past names.
+
+    Typing shows matches; Up/Down move through them without leaving the
+    box; Enter or Tab takes the highlighted one; a click or tap takes the
+    one touched; Escape closes the list. Typing a new name is unaffected.
+    """
+
+    def __init__(self, entry, var, get_names, min_chars=1, limit=8):
+        self.entry, self.var, self.get_names = entry, var, get_names
+        self.min_chars, self.limit = min_chars, limit
+        self.popup = None
+        self.listbox = None
+        self.matches = []
+        entry.bind('<KeyRelease>', self._on_key_release, add='+')
+        entry.bind('<KeyPress>', self._on_key_press, add='+')
+        entry.bind('<FocusOut>', lambda e: entry.after(200, self._close_if_unfocused), add='+')
+        top = entry.winfo_toplevel()
+        top.bind('<Configure>', lambda e: self.close(), add='+')
+
+    def _on_key_release(self, event):
+        if event.keysym in ('Up', 'Down', 'Return', 'KP_Enter', 'Tab', 'Escape',
+                            'Left', 'Right', 'Shift_L', 'Shift_R', 'Control_L',
+                            'Control_R', 'Alt_L', 'Alt_R'):
+            return
+        text = self.var.get()
+        if len(text.strip()) < self.min_chars:
+            self.close()
+            return
+        try:
+            names = self.get_names() or {}
+        except Exception as e:
+            print(f"Autocomplete: could not load names: {e}")
+            names = {}
+        self.matches = rank_name_matches(text, names, self.limit)
+        if self.matches:
+            self._show()
+        else:
+            self.close()
+
+    def _on_key_press(self, event):
+        if not self.popup:
+            return None
+        if event.keysym in ('Down', 'Up'):
+            sel = self.listbox.curselection()
+            i = sel[0] if sel else -1
+            i = min(i + 1, len(self.matches) - 1) if event.keysym == 'Down' else max(i - 1, 0)
+            self.listbox.selection_clear(0, 'end')
+            self.listbox.selection_set(i)
+            self.listbox.see(i)
+            return 'break'
+        if event.keysym in ('Return', 'KP_Enter', 'Tab'):
+            sel = self.listbox.curselection()
+            if sel:
+                self._choose(sel[0])
+                return 'break' if event.keysym != 'Tab' else None
+            self.close()
+            return None
+        if event.keysym == 'Escape':
+            self.close()
+            return 'break'
+        return None
+
+    def _show(self):
+        if not self.popup:
+            self.popup = tk.Toplevel(self.entry)
+            self.popup.wm_overrideredirect(True)
+            try:
+                self.popup.attributes('-topmost', True)
+            except tk.TclError:
+                pass
+            self.listbox = tk.Listbox(self.popup, font=('Arial', 11), activestyle='none',
+                                      selectbackground='#3498db', selectforeground='white',
+                                      relief='solid', borderwidth=1, takefocus=0,
+                                      exportselection=False)
+            self.listbox.pack(fill='both', expand=True)
+            self.listbox.bind('<ButtonRelease-1>', self._on_click)
+        self.listbox.delete(0, 'end')
+        for name in self.matches:
+            self.listbox.insert('end', name)
+        self.listbox.configure(height=len(self.matches))
+        self.listbox.selection_clear(0, 'end')
+        self.listbox.selection_set(0)
+        self.entry.update_idletasks()
+        x = self.entry.winfo_rootx()
+        y = self.entry.winfo_rooty() + self.entry.winfo_height()
+        width = max(self.entry.winfo_width(), 220)
+        row_h = max(18, self.listbox.winfo_reqheight() // max(1, len(self.matches)))
+        self.popup.geometry(f"{width}x{row_h * len(self.matches) + 4}+{x}+{y}")
+        self.popup.lift()
+
+    def _on_click(self, event):
+        i = self.listbox.nearest(event.y)
+        if 0 <= i < len(self.matches):
+            self._choose(i)
+
+    def _choose(self, i):
+        self.var.set(self.matches[i])
+        self.close()
+        self.entry.focus_set()
+        self.entry.icursor('end')
+
+    def _close_if_unfocused(self):
+        try:
+            focused = self.entry.focus_get()
+        except Exception:
+            focused = None
+        if focused is not self.entry and (not self.popup or focused is not self.listbox):
+            self.close()
+
+    def close(self):
+        if self.popup:
+            try:
+                self.popup.destroy()
+            except Exception:
+                pass
+        self.popup = None
+        self.listbox = None
 
 
 MAX_LABOR_RATES = 10
@@ -2134,8 +2283,12 @@ class MachineRepairApp:
         tk.Label(fields_frame, text="Customer Name:", font=('Arial', 10, 'bold'),
                 fg='#ecf0f1', bg='#34495e').pack(anchor='w', pady=(0, 5))
         self.customer_var = tk.StringVar()
-        tk.Entry(fields_frame, textvariable=self.customer_var, font=('Arial', 10),
-                width=30).pack(fill='x', pady=(0, 10))
+        customer_entry = tk.Entry(fields_frame, textvariable=self.customer_var,
+                                  font=('Arial', 10), width=30)
+        customer_entry.pack(fill='x', pady=(0, 10))
+        # Suggest customers already in the log as you type
+        self.customer_autocomplete = NameAutocomplete(
+            customer_entry, self.customer_var, self.past_customer_names)
         
         # Arrival Date
         tk.Label(fields_frame, text="Date of Arrival:", font=('Arial', 10, 'bold'),
@@ -2474,6 +2627,26 @@ class MachineRepairApp:
         details_frame.grid_rowconfigure(0, weight=1)
         details_frame.grid_columnconfigure(0, weight=1)
     
+    def past_customer_names(self):
+        """{customer name: number of jobs} across active and past repairs.
+
+        'miller farms' and 'Miller Farms ' count as one customer, shown with
+        the spelling used most often.
+        """
+        spellings = {}
+        for m in list(self.active_machines) + list(self.shipped_machines):
+            name = ' '.join(str(m.get('customer_name', '') or '').split())
+            if not name:
+                continue
+            key = name.lower()
+            spellings.setdefault(key, {})
+            spellings[key][name] = spellings[key].get(name, 0) + 1
+        out = {}
+        for variants in spellings.values():
+            best = max(variants.items(), key=lambda kv: kv[1])[0]
+            out[best] = sum(variants.values())
+        return out
+
     def generate_estimate_number(self, date_str):
         """Generate estimate number in format MMDDYY-XXX"""
         try:
