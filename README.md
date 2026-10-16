@@ -3,12 +3,14 @@
 Windows desktop app for tracking machine repairs, service orders and customer
 sign-off, built for field and shop technicians.
 
-**Current version: 1.3.2**
+**Current version: 1.3.3**
 
 ## What it does
 
 - Repair log with active and past jobs, split by **Field** vs **Shop**
 - Service orders with parts lookup, labor, totals and on-screen customer signature
+- Up to 10 named labor rates (Settings > Labor Rates in a service order),
+  shared by every computer and picked from a dropdown
 - **Customer copy PDF** of completed work, with the signature rendered on it
 - Opens an **Outlook draft** with that PDF attached, addressed to the customer
 - Brother label printing and barcode / webcam scanning

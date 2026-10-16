@@ -39,7 +39,7 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
@@ -548,6 +548,35 @@ def renumber_conflict(active, shipped, conflict):
     return changes
 
 
+MAX_LABOR_RATES = 10
+# Used until rates are set up, so new service orders price the same as before
+DEFAULT_LABOR_RATES = [{'name': 'Standard', 'rate': '150.00'}]
+
+
+def parse_money(text):
+    """'$1,250.5' -> 1250.5. None if it isn't a number."""
+    try:
+        return float(str(text).replace('$', '').replace(',', '').strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_labor_rates(rates):
+    """Keep only rates that have a name and a valid, non-negative price,
+    in order, at most MAX_LABOR_RATES. Prices are stored as '150.00'."""
+    out, seen = [], set()
+    for r in rates or []:
+        if not isinstance(r, dict):
+            continue
+        name = ' '.join(str(r.get('name', '') or '').split())
+        rate = parse_money(r.get('rate', ''))
+        if not name or rate is None or rate < 0 or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({'name': name, 'rate': f"{rate:.2f}"})
+    return out[:MAX_LABOR_RATES]
+
+
 class MachineRepairApp:
     def __init__(self, root):
         self.root = root
@@ -573,6 +602,8 @@ class MachineRepairApp:
         self.price_lists = {}
         self.service_orders_dir = ""
         self._service_order_windows = []
+        self.labor_rates = [dict(r) for r in DEFAULT_LABOR_RATES]
+        self.labor_rates_updated = ""   # '' = never set up on this computer
         
         # Initialize GUI components to None
         self.status_label = None
@@ -635,7 +666,12 @@ class MachineRepairApp:
             os.makedirs(self.service_orders_dir, exist_ok=True)
         except Exception as e:
             print(f"Could not create service orders dir (offline?): {e}")
-        
+
+        try:
+            self.load_labor_rates()
+        except Exception as e:
+            print(f"Could not load labor rates: {e}")
+
         self.load_data()
         
         # Create GUI components
@@ -775,9 +811,12 @@ class MachineRepairApp:
                     self.company_name = settings.get('company_name', '')
                     self.price_list_folder = settings.get('price_list_folder', '')
                     self.column_mappings = settings.get('column_mappings', {})
+                    if 'labor_rates' in settings:
+                        self.labor_rates = clean_labor_rates(settings.get('labor_rates'))
+                        self.labor_rates_updated = str(settings.get('labor_rates_updated', '') or '')
             except Exception as e:
                 print(f"Error loading settings: {e}")
-    
+
     def save_settings(self):
         """Save app settings"""
         settings = {
@@ -786,13 +825,67 @@ class MachineRepairApp:
             'printer_identifier': self.printer_identifier,
             'company_name': self.company_name,
             'price_list_folder': self.price_list_folder,
-            'column_mappings': self.column_mappings
+            'column_mappings': self.column_mappings,
+            # Local copy of the shared labor rates, used when the share is offline
+            'labor_rates': self.labor_rates,
+            'labor_rates_updated': self.labor_rates_updated,
         }
         try:
             with open("repair_settings.json", 'w') as f:
                 json.dump(settings, f)
         except Exception as e:
             print(f"Error saving settings: {e}")
+
+    # ---------------- Labor rates ----------------
+    # Kept in the shared data folder so every computer uses the same rates,
+    # with a copy in this computer's settings for when the share is down.
+    # Whichever copy was changed most recently wins.
+
+    def get_labor_rates_path(self):
+        return os.path.join(os.path.dirname(self.save_location), "labor_rates.json")
+
+    def load_labor_rates(self):
+        """Pick up the shared labor rates (another computer may have changed
+        them). Pushes this computer's copy up if it is the newer one."""
+        shared = self._read_json(self.get_labor_rates_path())
+        if shared and 'rates' in shared:
+            shared_stamp = str(shared.get('updated_at', '') or '')
+            if shared_stamp >= (self.labor_rates_updated or ''):
+                rates = clean_labor_rates(shared.get('rates'))
+                if rates != self.labor_rates or shared_stamp != self.labor_rates_updated:
+                    self.labor_rates = rates
+                    self.labor_rates_updated = shared_stamp
+                    self.save_settings()
+                return
+        # Share has nothing, or an older copy: offer ours if it was ever set
+        if self.labor_rates_updated:
+            self._write_shared_labor_rates()
+
+    def _write_shared_labor_rates(self):
+        try:
+            path = self.get_labor_rates_path()
+            tmp = path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'rates': self.labor_rates,
+                           'updated_at': self.labor_rates_updated}, f, indent=2)
+            os.replace(tmp, path)
+            return True
+        except Exception as e:
+            print(f"Could not write shared labor rates: {e}")
+            return False
+
+    def save_labor_rates(self, rates):
+        """Store new labor rates. Returns True if they reached the share."""
+        self.labor_rates = clean_labor_rates(rates)
+        self.labor_rates_updated = datetime.now().isoformat()
+        self.save_settings()
+        shared_ok = self._write_shared_labor_rates()
+        for win in list(getattr(self, '_service_order_windows', []) or []):
+            try:
+                win.refresh_labor_rate_choices()
+            except Exception as e:
+                print(f"Could not refresh labor rates in an open service order: {e}")
+        return shared_ok
     
     def get_local_backup_path(self):
         """Get path for local backup file (stored in user's local AppData)"""
@@ -5603,7 +5696,13 @@ class ServiceOrderWindow:
         
         # Service orders directory
         self.service_orders_dir = parent_app.service_orders_dir
-        
+
+        # Another computer may have changed the shared labor rates
+        try:
+            parent_app.load_labor_rates()
+        except Exception as e:
+            print(f"Could not refresh labor rates: {e}")
+
         # Create GUI
         self.create_widgets()
         
@@ -5637,6 +5736,19 @@ class ServiceOrderWindow:
     
     def create_widgets(self):
         """Create the main GUI"""
+        # Menu bar along the top of the window. Unlike the toolbar it never
+        # gets cut off when the window is narrower than the form.
+        menubar = tk.Menu(self.window)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="Labor Rates...", command=self.configure_labor_rates)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Set Price Lists Folder...",
+                                  command=self.set_price_list_folder)
+        settings_menu.add_command(label="Configure Price List Columns...",
+                                  command=self.configure_price_list_columns)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        self.window.config(menu=menubar)
+
         # Create main canvas with scrollbar for the whole form
         main_canvas = tk.Canvas(self.root, bg='#1a252f', highlightthickness=0)
         scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
@@ -6007,11 +6119,22 @@ class ServiceOrderWindow:
         labor_entry = tk.Entry(totals_grid, textvariable=self.labor_qty_var, width=12, font=('Arial', 12))
         labor_entry.grid(row=1, column=1, pady=5, padx=5, sticky='w')
         
-        # Labor Rate
-        tk.Label(totals_grid, text="Labor Rate ($/hr):", font=('Arial', 12, 'bold'),
+        # Labor Rate - picked from the configured rates (Settings > Labor Rates), not typed.
+        # labor_rate_var holds the price used everywhere else; the dropdown
+        # shows the rate's name.
+        tk.Label(totals_grid, text="Labor Rate:", font=('Arial', 12, 'bold'),
                 fg='white', bg='#2c3e50').grid(row=2, column=0, sticky='e', pady=5, padx=5)
-        self.labor_rate_var = tk.StringVar(master=self.root, value="150.00")
-        tk.Entry(totals_grid, textvariable=self.labor_rate_var, width=12, font=('Arial', 12)).grid(row=2, column=1, pady=5, padx=5, sticky='w')
+        rate_cell = tk.Frame(totals_grid, bg='#2c3e50')
+        rate_cell.grid(row=2, column=1, pady=5, padx=5, sticky='w')
+        self.labor_rate_var = tk.StringVar(master=self.root, value="0.00")
+        self.labor_rate_name_var = tk.StringVar(master=self.root, value="")
+        self.labor_rate_combo = ttk.Combobox(rate_cell, textvariable=self.labor_rate_name_var,
+                                             state='readonly', width=24, font=('Arial', 12))
+        self.labor_rate_combo.pack(side='left')
+        self.labor_rate_combo.bind('<<ComboboxSelected>>', self._on_labor_rate_selected)
+        self.labor_rate_display = tk.Label(rate_cell, text="", font=('Arial', 12, 'bold'),
+                                           fg='#ecf0f1', bg='#2c3e50')
+        self.labor_rate_display.pack(side='left', padx=10)
         
         # Labor Total
         tk.Label(totals_grid, text="Labor Total:", font=('Arial', 12, 'bold'),
@@ -6036,7 +6159,10 @@ class ServiceOrderWindow:
             self.labor_rate_var.trace_add('write', lambda *args: self.calculate_totals())
         except AttributeError:
             self.labor_rate_var.trace('w', lambda *args: self.calculate_totals())
-        
+
+        # New orders start on the first configured rate
+        self.select_default_labor_rate()
+
         # === SIGNATURE SECTION ===
         sig_section = tk.Frame(form_frame, bg='#2c3e50', relief='ridge', bd=2)
         sig_section.pack(fill='x', pady=5)
@@ -6359,8 +6485,182 @@ class ServiceOrderWindow:
         # Grand total
         grand_total = parts_total + labor_total
         self.grand_total_var.set(f"${grand_total:.2f}")
-    
-    
+
+    # ---------------- Labor rate dropdown ----------------
+
+    def _configured_labor_rates(self):
+        return list(getattr(self.parent_app, 'labor_rates', []) or [])
+
+    def _labor_line_label(self):
+        """'Labor - Field Service' on PDFs, or just 'Labor' if unnamed."""
+        name = self.labor_rate_name_var.get().strip()
+        return f"Labor - {name}" if name else "Labor"
+
+    def _find_labor_rate(self, name):
+        for r in self._configured_labor_rates():
+            if r['name'] == name:
+                return r
+        return None
+
+    def _update_labor_rate_display(self):
+        """Show the actual $/hr next to the dropdown."""
+        rates = self._configured_labor_rates()
+        price = parse_money(self.labor_rate_var.get())
+        if not rates and not self.labor_rate_name_var.get():
+            self.labor_rate_display.config(
+                text="No labor rates set up - use Settings > Labor Rates at the top",
+                fg='#e67e22')
+            return
+        text = f"${price:.2f}/hr" if price is not None else ""
+        current = self._find_labor_rate(self.labor_rate_name_var.get())
+        if price is not None and (current is None or parse_money(current['rate']) != price):
+            # Saved order whose rate has since changed, been removed, or
+            # predates named rates - it keeps the price it was saved with
+            text += "  (saved on this order)"
+            self.labor_rate_display.config(text=text, fg='#f39c12')
+        else:
+            self.labor_rate_display.config(text=text, fg='#ecf0f1')
+
+    def refresh_labor_rate_choices(self):
+        """Reload the dropdown from the configured rates. Called after the
+        rates are edited. If the selected rate's price changed, it follows."""
+        rates = self._configured_labor_rates()
+        self.labor_rate_combo['values'] = [r['name'] for r in rates]
+        current = self._find_labor_rate(self.labor_rate_name_var.get())
+        if current:
+            self.labor_rate_var.set(current['rate'])
+        elif not self.labor_rate_name_var.get() and not parse_money(self.labor_rate_var.get()):
+            # Nothing chosen yet (e.g. rates were empty before) - use the default
+            self.select_default_labor_rate()
+            return
+        self._update_labor_rate_display()
+
+    def select_default_labor_rate(self):
+        rates = self._configured_labor_rates()
+        self.labor_rate_combo['values'] = [r['name'] for r in rates]
+        if rates:
+            self.labor_rate_name_var.set(rates[0]['name'])
+            self.labor_rate_var.set(rates[0]['rate'])
+        else:
+            self.labor_rate_name_var.set('')
+            self.labor_rate_var.set('0.00')
+        self._update_labor_rate_display()
+
+    def _on_labor_rate_selected(self, event=None):
+        r = self._find_labor_rate(self.labor_rate_name_var.get())
+        if r:
+            self.labor_rate_var.set(r['rate'])
+        self._update_labor_rate_display()
+
+    def set_saved_labor_rate(self, name, rate):
+        """Show the rate a saved order was priced with. The saved price is
+        kept even if that rate has been changed or removed since."""
+        self.labor_rate_combo['values'] = [r['name'] for r in self._configured_labor_rates()]
+        price = parse_money(rate)
+        self.labor_rate_var.set(f"{price:.2f}" if price is not None else '0.00')
+        name = str(name or '').strip()
+        if not name:
+            # Order saved before named rates: show the matching name if the
+            # price lines up with one, otherwise just the saved price
+            for r in self._configured_labor_rates():
+                if price is not None and parse_money(r['rate']) == price:
+                    name = r['name']
+                    break
+        self.labor_rate_name_var.set(name)
+        self._update_labor_rate_display()
+
+    def configure_labor_rates(self):
+        """Set up to MAX_LABOR_RATES named labor rates for the dropdown."""
+        dlg = tk.Toplevel(self.window)
+        dlg.title("Labor Rates")
+        dlg.configure(bg='#2c3e50')
+        dlg.transient(self.window)
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="Labor Rates", font=('Arial', 16, 'bold'),
+                 fg='white', bg='#2c3e50').pack(anchor='w', padx=20, pady=(15, 2))
+        tk.Label(dlg, justify='left', fg='#bdc3c7', bg='#2c3e50', font=('Arial', 10),
+                 text=(f"Enter up to {MAX_LABOR_RATES} rates. Only rows with a name appear "
+                       "in the Labor Rate dropdown.\nThe first one is the default for new "
+                       "service orders. Shared with every computer.")
+                 ).pack(anchor='w', padx=20, pady=(0, 10))
+
+        grid = tk.Frame(dlg, bg='#2c3e50')
+        grid.pack(padx=20)
+        for col, text in enumerate(("", "Name (shown in dropdown)", "Rate ($/hr)")):
+            tk.Label(grid, text=text, font=('Arial', 10, 'bold'), fg='#ecf0f1',
+                     bg='#2c3e50').grid(row=0, column=col, sticky='w', padx=4, pady=(0, 4))
+
+        current = self._configured_labor_rates()
+        rows = []
+        for i in range(MAX_LABOR_RATES):
+            existing = current[i] if i < len(current) else {'name': '', 'rate': ''}
+            name_var = tk.StringVar(master=dlg, value=existing['name'])
+            rate_var = tk.StringVar(master=dlg, value=existing['rate'])
+            tk.Label(grid, text=f"{i + 1}.", fg='#95a5a6', bg='#2c3e50',
+                     font=('Arial', 10)).grid(row=i + 1, column=0, sticky='e', padx=4)
+            name_entry = tk.Entry(grid, textvariable=name_var, width=30, font=('Arial', 11))
+            name_entry.grid(row=i + 1, column=1, padx=4, pady=2)
+            tk.Entry(grid, textvariable=rate_var, width=12, font=('Arial', 11),
+                     justify='right').grid(row=i + 1, column=2, padx=4, pady=2)
+            rows.append((name_var, rate_var))
+            if i == 0:
+                name_entry.focus_set()
+
+        def save():
+            rates, names = [], set()
+            for i, (name_var, rate_var) in enumerate(rows, start=1):
+                name = ' '.join(name_var.get().split())
+                rate_text = rate_var.get().strip()
+                if not name and not rate_text:
+                    continue
+                if not name:
+                    messagebox.showerror("Labor Rates",
+                                         f"Row {i}: give the ${rate_text} rate a name, "
+                                         "or clear it.", parent=dlg)
+                    return
+                price = parse_money(rate_text)
+                if price is None or price < 0:
+                    messagebox.showerror("Labor Rates",
+                                         f"Row {i}: enter a rate in dollars per hour "
+                                         f"for '{name}' (for example 150.00).", parent=dlg)
+                    return
+                if name.lower() in names:
+                    messagebox.showerror("Labor Rates",
+                                         f"Row {i}: '{name}' is used twice. Each rate "
+                                         "needs its own name.", parent=dlg)
+                    return
+                names.add(name.lower())
+                rates.append({'name': name, 'rate': f"{price:.2f}"})
+
+            shared_ok = self.parent_app.save_labor_rates(rates)
+            dlg.destroy()
+            if not shared_ok:
+                messagebox.showwarning(
+                    "Labor Rates",
+                    "Saved on this computer, but the shared data folder couldn't be "
+                    "reached.\n\nThe rates will be shared with the other computers "
+                    "next time this program starts with the folder available.",
+                    parent=self.window)
+
+        buttons = tk.Frame(dlg, bg='#2c3e50')
+        buttons.pack(fill='x', padx=20, pady=15)
+        tk.Button(buttons, text="Save", command=save, bg='#27ae60', fg='white',
+                  font=('Arial', 11, 'bold'), width=10).pack(side='right')
+        tk.Button(buttons, text="Cancel", command=dlg.destroy, bg='#7f8c8d', fg='white',
+                  font=('Arial', 11), width=10).pack(side='right', padx=8)
+        dlg.bind('<Return>', lambda e: save())
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+        dlg.update_idletasks()
+        x = self.window.winfo_rootx() + max(0, (self.window.winfo_width() - dlg.winfo_width()) // 2)
+        y = self.window.winfo_rooty() + 80
+        dlg.geometry(f"+{x}+{y}")
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+
     def set_price_list_folder(self):
         """Set the folder containing vendor price list Excel files"""
         folder = filedialog.askdirectory(
@@ -7019,8 +7319,8 @@ class ServiceOrderWindow:
         self.prepower_var.set('NO')
         self.additional_var.set('NO')
         self.labor_qty_var.set('0')
-        self.labor_rate_var.set('150.00')
-        
+        self.select_default_labor_rate()
+
         self.reason_text.delete('1.0', tk.END)
         self.work_text.delete('1.0', tk.END)
         
@@ -7214,7 +7514,8 @@ class ServiceOrderWindow:
             self.prepower_var.set(data.get('prepower', 'NO'))
             self.additional_var.set(data.get('additional', 'NO'))
             self.labor_qty_var.set(data.get('labor_qty', '0'))
-            self.labor_rate_var.set(data.get('labor_rate', '150.00'))
+            self.set_saved_labor_rate(data.get('labor_rate_name', ''),
+                                      data.get('labor_rate', '150.00'))
             self.engineer_var.set(data.get('engineer', ''))
             self.sig_date_var.set(data.get('sig_date', ''))
             
@@ -7318,6 +7619,7 @@ class ServiceOrderWindow:
             'additional': self.additional_var.get(),
             'labor_qty': self.labor_qty_var.get(),
             'labor_rate': self.labor_rate_var.get(),
+            'labor_rate_name': self.labor_rate_name_var.get(),
             'engineer': self.engineer_var.get(),
             'sig_date': self.sig_date_var.get(),
             'customer_sig_name': self.customer_sig_name_var.get(),
@@ -7538,6 +7840,12 @@ class ServiceOrderWindow:
             c.setFont("Helvetica-Bold", 11)
             c.drawString(380, y, f"Parts Total: {self.parts_total_var.get()}")
             y -= 15
+            rate_name = self.labor_rate_name_var.get().strip()
+            if rate_name:
+                c.setFont("Helvetica", 10)
+                c.drawString(380, y, f"Labor rate: {rate_name}")
+                y -= 14
+                c.setFont("Helvetica-Bold", 11)
             c.drawString(380, y, f"Labor ({self.labor_qty_var.get()} hrs @ ${self.labor_rate_var.get()}/hr): {self.labor_total_var.get()}")
             y -= 20
             c.setFont("Helvetica-Bold", 14)
@@ -8415,20 +8723,27 @@ class ServiceOrderWindow:
             or _num(self.grand_total_var.get()) > 0
 
         if show_pricing and has_charges:
-            need(70)
+            need(84)
             box_left = RIGHT - 250
             c.setFont("Helvetica", 10)
             c.drawString(box_left, state['y'], "Parts Total:")
             c.drawRightString(RIGHT - 5, state['y'], self.parts_total_var.get() or "$0.00")
             state['y'] -= 15
 
-            labor_desc = "Labor:"
-            if self.labor_qty_var.get():
-                labor_desc = (f"Labor ({self.labor_qty_var.get()} hr @ "
-                              f"${self.labor_rate_var.get()}/hr):")
+            labor_label = self._labor_line_label()
+            hours = (f" ({self.labor_qty_var.get()} hr @ ${self.labor_rate_var.get()}/hr)"
+                     if self.labor_qty_var.get() else "")
+            labor_desc = f"{labor_label}{hours}:"
+            amount = self.labor_total_var.get() or "$0.00"
             c.setFont("Helvetica", 10)
+            room = (RIGHT - 5 - box_left) - c.stringWidth(amount, "Helvetica", 10) - 10
+            if c.stringWidth(labor_desc, "Helvetica", 10) > room:
+                # Long rate name: put it on its own line above the hours
+                c.drawString(box_left, state['y'], labor_label)
+                state['y'] -= 13
+                labor_desc = f"   {hours.strip()}:" if hours else "   Labor:"
             c.drawString(box_left, state['y'], labor_desc)
-            c.drawRightString(RIGHT - 5, state['y'], self.labor_total_var.get() or "$0.00")
+            c.drawRightString(RIGHT - 5, state['y'], amount)
             state['y'] -= 8
 
             c.setLineWidth(0.8)
@@ -8757,8 +9072,8 @@ class ServiceOrderWindow:
             self.prepower_var.set('NO')
             self.additional_var.set('NO')
             self.labor_qty_var.set('0')
-            self.labor_rate_var.set('150.00')
-            
+            self.select_default_labor_rate()
+
             # Clear text fields
             self.reason_text.delete('1.0', tk.END)
             self.work_text.delete('1.0', tk.END)
