@@ -5892,9 +5892,16 @@ class ServiceOrderWindow:
         header_left = tk.Frame(header_frame, bg='#2c3e50')
         header_left.pack(side='left', padx=20, pady=10)
         
-        tk.Label(header_left, text=self.company_name if self.company_name else "Service Order", 
+        tk.Label(header_left, text=self.company_name if self.company_name else "Service Order",
                 font=('Arial', 24, 'bold'), fg='#3498db', bg='#2c3e50').pack(anchor='w')
-        
+
+        # Kept up here on the left so it's visible at any window width
+        # (the right end of the toolbar is cut off on narrower screens)
+        tk.Button(header_frame, text="⚙ Labor Rates", command=self.configure_labor_rates,
+                  bg='#d35400', fg='white', activebackground='#e67e22',
+                  font=('Arial', 11, 'bold'), padx=12, pady=4,
+                  cursor='hand2').pack(side='left', padx=10, pady=10)
+
         header_right = tk.Frame(header_frame, bg='#2c3e50')
         header_right.pack(side='right', padx=20, pady=10)
         
@@ -6242,6 +6249,9 @@ class ServiceOrderWindow:
                                              state='readonly', width=24, font=('Arial', 12))
         self.labor_rate_combo.pack(side='left')
         self.labor_rate_combo.bind('<<ComboboxSelected>>', self._on_labor_rate_selected)
+        tk.Button(rate_cell, text="⚙ Edit Rates", command=self.configure_labor_rates,
+                  bg='#7f8c8d', fg='white', font=('Arial', 9, 'bold'),
+                  cursor='hand2').pack(side='left', padx=(8, 0))
         self.labor_rate_display = tk.Label(rate_cell, text="", font=('Arial', 12, 'bold'),
                                            fg='#ecf0f1', bg='#2c3e50')
         self.labor_rate_display.pack(side='left', padx=10)
@@ -6618,7 +6628,7 @@ class ServiceOrderWindow:
         price = parse_money(self.labor_rate_var.get())
         if not rates and not self.labor_rate_name_var.get():
             self.labor_rate_display.config(
-                text="No labor rates set up - use Settings > Labor Rates at the top",
+                text="No labor rates set up - click ⚙ Edit Rates",
                 fg='#e67e22')
             return
         text = f"${price:.2f}/hr" if price is not None else ""
