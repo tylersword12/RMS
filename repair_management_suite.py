@@ -41,7 +41,7 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
@@ -69,6 +69,40 @@ def https_context():
             print(f"Bundled certificates not available: {e}")
         _HTTPS_CONTEXT = ctx
     return _HTTPS_CONTEXT
+
+
+def clean_child_environment():
+    """Environment for starting a fresh, independent copy of this program.
+
+    A PyInstaller one-file EXE passes private variables (_PYI_*, _MEIPASS2)
+    to everything it starts. A new copy of the EXE that inherits them thinks
+    it is a helper of the old copy and tries to load Python from the old
+    copy's temporary folder - which is deleted once the old copy closes,
+    so it fails with 'Failed to load Python DLL'. Strip those, drop
+    anything pointing into our temp folder, and ask the bootloader to
+    reset (PYINSTALLER_RESET_ENVIRONMENT, PyInstaller 6.9+).
+    """
+    env = dict(os.environ)
+    for k in list(env):
+        if k.upper().startswith('_PYI_') or k.upper() == '_MEIPASS2':
+            env.pop(k, None)
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        root = os.path.normcase(os.path.abspath(meipass))
+
+        def inside(p):
+            try:
+                return os.path.normcase(os.path.abspath(p)).startswith(root)
+            except Exception:
+                return False
+        for k in list(env):
+            v = env[k] or ''
+            if k.upper() == 'PATH':
+                env[k] = os.pathsep.join(p for p in v.split(os.pathsep) if p and not inside(p))
+            elif root in os.path.normcase(v):
+                env.pop(k, None)          # e.g. TCL_LIBRARY / TK_LIBRARY
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
 
 
 def describe_network_error(e):
@@ -5240,7 +5274,8 @@ class MachineRepairApp:
             self._update_result_color = '#27ae60'
         else:
             self._update_result_message = (
-                f"⚠ Update to {expected} did not take - still running {APP_VERSION}")
+                f"⚠ Update to {expected} did not take - still running {APP_VERSION}. "
+                "Next time choose 'Install and Stay Closed', then open the program yourself.")
             self._update_result_color = '#e74c3c'
 
     def _show_update_result(self):
@@ -5373,16 +5408,20 @@ class MachineRepairApp:
                     staging, target, staged, backup, flag, log,
                     info['size'], relaunch, info['version_str'])
                 creationflags = 0x00000008 | 0x08000000  # DETACHED | NO_WINDOW
+                # Clean environment, or the relaunched EXE fails with
+                # 'Failed to load Python DLL' (see clean_child_environment)
                 subprocess.Popen(['cmd.exe', '/c', script],
                                  creationflags=creationflags,
-                                 close_fds=True)
+                                 close_fds=True,
+                                 env=clean_child_environment())
             else:
                 script = self._write_posix_updater(
                     staging, target, staged, backup, flag, log,
                     info['size'], relaunch)
                 subprocess.Popen(['/bin/sh', script],
                                  start_new_session=True,
-                                 close_fds=True)
+                                 close_fds=True,
+                                 env=clean_child_environment())
             return True, None
         except Exception as e:
             try:
@@ -5411,6 +5450,16 @@ set "LOG={log}"
 set "EXENAME={exe_name}"
 set "EXPECTSIZE={expected_size}"
 set "RELAUNCH={'1' if relaunch else '0'}"
+
+rem --- Start the program fresh, not as a helper of the old copy. Inherited
+rem --- PyInstaller variables make it look for Python in the old copy's
+rem --- deleted temp folder ("Failed to load Python DLL").
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+set "_MEIPASS2="
+set "_PYI_ARCHIVE_FILE="
+set "_PYI_APPLICATION_HOME_DIR="
+set "_PYI_PARENT_PROCESS_LEVEL="
+set "_PYI_SPLASH_IPC="
 
 echo ================================================= >>"%LOG%"
 echo [%DATE% %TIME%] update to {version_str} starting >>"%LOG%"
