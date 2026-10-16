@@ -87,6 +87,10 @@ echo   Installing pyzbar (barcode decoding)...
 pip install pyzbar
 if errorlevel 1 ( echo FAILED & pause & exit /b 1 )
 
+echo   Installing certifi (trusted certificates for update checks)...
+pip install certifi
+if errorlevel 1 ( echo FAILED & pause & exit /b 1 )
+
 echo   Installing pywin32 (Outlook email integration)...
 pip install pywin32
 if errorlevel 1 ( echo Continuing without pywin32 - Outlook will use command-line fallback )
@@ -103,6 +107,7 @@ python -c "from reportlab.pdfgen import canvas; print('  OK: reportlab')"
 python -c "import xlrd; print('  OK: xlrd')"
 python -c "import cv2; print('  OK: opencv-python')"
 python -c "from pyzbar import pyzbar; print('  OK: pyzbar')"
+python -c "import certifi; print('  OK: certifi')"
 python -c "import win32com.client; print('  OK: pywin32')" 2>nul || echo   WARN: pywin32 missing - Outlook attach falls back to command line
 
 :: Locate package paths
@@ -194,6 +199,8 @@ pyinstaller --onefile --noconsole --name "RepairManagementSuite" ^
     --hidden-import=pythoncom ^
     --hidden-import=pywintypes ^
     --hidden-import=win32api ^
+    --hidden-import=certifi ^
+    --collect-data=certifi ^
     --hidden-import=libusb_package ^
     --hidden-import=usb1 ^
     --collect-all=brother_ql ^

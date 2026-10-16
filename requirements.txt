@@ -13,5 +13,9 @@ libusb-package>=1.0
 opencv-python>=4.8
 pyzbar>=0.1.9
 
+# Trusted certificates bundled into the EXE, so update checks don't depend
+# on which root certificates Windows has already downloaded
+certifi>=2024.2.2
+
 # Outlook integration (Windows only - ignored elsewhere)
 pywin32>=306 ; sys_platform == "win32"

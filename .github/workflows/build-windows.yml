@@ -55,6 +55,7 @@ jobs:
           python -c "from pyzbar import pyzbar; print('pyzbar ok')"
           python -c "import xlrd; print('xlrd ok')"
           python -c "import win32com.client; print('pywin32 ok')"
+          python -c "import certifi; print('certifi ok', certifi.where())"
 
       - name: Build the EXE
         shell: cmd
@@ -108,6 +109,8 @@ jobs:
             --hidden-import=pythoncom ^
             --hidden-import=pywintypes ^
             --hidden-import=win32api ^
+            --hidden-import=certifi ^
+            --collect-data=certifi ^
             --collect-all=brother_ql ^
             --collect-all=barcode ^
             --collect-all=usb ^

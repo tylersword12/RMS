@@ -16,6 +16,8 @@ import os
 import sys
 import re
 import threading
+import socket
+import ssl
 import subprocess
 import uuid
 import urllib.request
@@ -39,12 +41,53 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
                      f"{GITHUB_REPO}/releases/latest")
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
+
+_HTTPS_CONTEXT = None
+
+
+def https_context():
+    """Secure-connection settings for talking to GitHub.
+
+    Trusts the certificates Windows has AND the copy bundled with the program
+    (certifi). Windows only downloads some root certificates when a browser
+    first needs them, so relying on Windows alone can fail on a machine that
+    hasn't visited the site yet - even though the browser works fine.
+    """
+    global _HTTPS_CONTEXT
+    if _HTTPS_CONTEXT is None:
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+        except Exception as e:
+            print(f"Bundled certificates not available: {e}")
+        _HTTPS_CONTEXT = ctx
+    return _HTTPS_CONTEXT
+
+
+def describe_network_error(e):
+    """Plain-English reason a request to GitHub failed."""
+    reason = getattr(e, 'reason', e)
+    text = str(reason)
+    if isinstance(reason, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in text:
+        return ("The secure connection to GitHub couldn't be verified (certificate "
+                "problem). Antivirus or network filtering that inspects secure "
+                f"traffic often causes this.\n\nDetail: {text}")
+    if isinstance(reason, ssl.SSLError):
+        return f"The secure connection to GitHub failed.\n\nDetail: {text}"
+    if isinstance(reason, (socket.timeout, TimeoutError)) or 'timed out' in text.lower():
+        return ("GitHub didn't answer in time. The internet connection may be slow, "
+                "or a firewall may be blocking it.")
+    if isinstance(reason, socket.gaierror):
+        return ("Couldn't find github.com. This computer may be offline, or DNS is "
+                f"blocked.\n\nDetail: {text}")
+    return f"Couldn't connect to GitHub.\n\nDetail: {type(reason).__name__}: {text}"
 
 
 def parse_version(text):
@@ -5385,8 +5428,15 @@ rm -f "$0"
     #   5. If the new build never starts, the old one is put back.
     # ==================================================================
 
+    def _set_update_status(self, code, message):
+        """Remember why the last check did or didn't find an update, so the
+        Check for Updates button can say so instead of 'up to date'."""
+        self._update_check_status = (code, message)
+        print(f"Update check [{code}]: {message}")
+
     def fetch_latest_release(self, timeout=12):
-        """Ask GitHub for the newest published release. None if unreachable."""
+        """Ask GitHub for the newest published release. None on failure,
+        with the reason stored by _set_update_status."""
         req = urllib.request.Request(
             GITHUB_API_LATEST,
             headers={
@@ -5395,42 +5445,63 @@ rm -f "$0"
                 'User-Agent': f'RepairManagementSuite/{APP_VERSION}',
             })
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=https_context()) as resp:
                 if resp.status != 200:
-                    print(f"Update check: GitHub returned HTTP {resp.status}")
+                    self._set_update_status(
+                        'error', f"GitHub answered with an unexpected status (HTTP {resp.status}).")
                     return None
                 return json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                print("Update check: no releases published yet")
-            elif e.code == 403:
-                print("Update check: GitHub rate limit reached - will retry next launch")
+                self._set_update_status(
+                    'error', f"No releases have been published at "
+                             f"github.com/{GITHUB_OWNER}/{GITHUB_REPO} yet.")
+            elif e.code in (403, 429) and str(e.headers.get('X-RateLimit-Remaining', '')) == '0':
+                when = ''
+                try:
+                    reset = int(e.headers.get('X-RateLimit-Reset', '0'))
+                    when = " It resets at " + datetime.fromtimestamp(reset).strftime('%I:%M %p').lstrip('0') + "."
+                except Exception:
+                    pass
+                self._set_update_status(
+                    'error', "GitHub's limit on update checks from this network has been "
+                             f"reached (60 per hour).{when}")
             else:
-                print(f"Update check: HTTP error {e.code}")
+                self._set_update_status(
+                    'error', f"GitHub refused the request (HTTP {e.code} {e.reason}).")
             return None
         except Exception as e:
-            # No internet, DNS blocked, proxy, firewall - all normal in a shop
-            print(f"Update check: could not reach GitHub ({e})")
+            # No internet, DNS blocked, proxy, firewall, certificate problems
+            self._set_update_status('error', describe_network_error(e))
             return None
 
     def find_available_update(self):
         """Return details of a newer release, or None.
 
         {'version_str', 'tag', 'url', 'size', 'filename', 'notes'}
+        The reason for a None is in self._update_check_status.
         """
+        self._update_check_status = ('error', "The update check didn't finish.")
         release = self.fetch_latest_release()
         if not release:
             return None
         if release.get('draft') or release.get('prerelease'):
+            self._set_update_status('current', "The newest release is a draft or pre-release.")
             return None
 
         tag = str(release.get('tag_name', '') or '')
         ver = parse_version(tag.lstrip('vV'))
         if not ver:
-            print(f"Update check: release tag '{tag}' is not a version number")
+            self._set_update_status(
+                'error', f"The newest release on GitHub is tagged '{tag}', which isn't a "
+                         "version number. Tags should look like v1.3.4.")
             return None
 
         if version_key(ver) <= version_key(APP_VERSION):
+            self._set_update_status(
+                'current', f"You're on the newest version. The latest release on GitHub "
+                           f"is {format_version(ver)}.")
             return None
 
         # Find the Windows EXE attached to the release
@@ -5442,8 +5513,12 @@ rm -f "$0"
                 asset = a
                 break
         if not asset:
-            print(f"Update check: release {tag} has no {want} asset attached")
+            self._set_update_status(
+                'building', f"Version {format_version(ver)} has been published, but its "
+                            "program file isn't attached yet. GitHub is usually still "
+                            "building it - try again in about 5 minutes.")
             return None
+        self._set_update_status('available', f"Version {format_version(ver)} is available.")
 
         return {
             'version_str': format_version(ver),
@@ -5460,6 +5535,7 @@ rm -f "$0"
         Returns the downloaded path, or None on failure.
         """
         staging = self.get_update_staging_dir()
+        self._download_error = ''
 
         # Clear anything left from a previous run
         try:
@@ -5480,7 +5556,8 @@ rm -f "$0"
             headers={'User-Agent': f'RepairManagementSuite/{APP_VERSION}',
                      'Accept': 'application/octet-stream'})
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp, open(part, 'wb') as f:
+            with urllib.request.urlopen(req, timeout=60, context=https_context()) as resp, \
+                    open(part, 'wb') as f:
                 total = info.get('size') or int(resp.headers.get('Content-Length') or 0)
                 got = 0
                 while True:
@@ -5496,6 +5573,7 @@ rm -f "$0"
                             pass
         except Exception as e:
             print(f"Update download failed: {e}")
+            self._download_error = describe_network_error(e)
             try:
                 if os.path.exists(part):
                     os.remove(part)
@@ -5508,6 +5586,8 @@ rm -f "$0"
             actual = os.path.getsize(part)
             if info.get('size') and actual != info['size']:
                 print(f"Update download incomplete: {actual} of {info['size']} bytes")
+                self._download_error = (f"The download stopped early ({actual:,} of "
+                                        f"{info['size']:,} bytes), so it was discarded.")
                 os.remove(part)
                 return None
             if actual <= 0:
@@ -5518,6 +5598,7 @@ rm -f "$0"
             os.rename(part, dest)
         except Exception as e:
             print(f"Update verification failed: {e}")
+            self._download_error = f"The downloaded file couldn't be saved.\n\nDetail: {e}"
             return None
 
         return dest
@@ -5530,6 +5611,19 @@ rm -f "$0"
             try:
                 info = self.find_available_update()
                 if not info:
+                    code, _msg = getattr(self, '_update_check_status', ('', ''))
+                    banner = None
+                    if code == 'error':
+                        banner = ("⚠ Couldn't check for updates - click Check for Updates "
+                                  "to see why", '#e67e22')
+                    elif code == 'building':
+                        banner = ("⏳ A new version is still being built - check again "
+                                  "in a few minutes", '#95a5a6')
+                    if banner:
+                        try:
+                            self.root.after(0, lambda: self._set_update_banner(*banner))
+                        except Exception:
+                            pass
                     return
                 try:
                     self.root.after(0, lambda: self._set_update_banner(
@@ -5591,15 +5685,30 @@ rm -f "$0"
 
         info = self.find_available_update()
         if not info:
-            messagebox.showinfo(
-                "Up To Date",
-                f"You are running version {APP_VERSION}.\n\n"
-                f"No newer release was found at:\n"
-                f"github.com/{GITHUB_OWNER}/{GITHUB_REPO}\n\n"
-                "If you expected one, check that the build finished and that this "
-                "computer can reach github.com.")
-            if getattr(self, 'status_label', None):
-                self.status_label.config(text=f"Up to date (v{APP_VERSION})", fg='#27ae60')
+            code, message = getattr(self, '_update_check_status',
+                                    ('error', "The update check didn't finish."))
+            status = getattr(self, 'status_label', None)
+            if code == 'current':
+                messagebox.showinfo("Up To Date",
+                                    f"You are running version {APP_VERSION}.\n\n{message}")
+                if status:
+                    status.config(text=f"Up to date (v{APP_VERSION})", fg='#27ae60')
+            elif code == 'building':
+                messagebox.showinfo("Update Not Ready Yet",
+                                    f"You are running version {APP_VERSION}.\n\n{message}")
+                if status:
+                    status.config(text="Update is still being built - try again shortly",
+                                  fg='#f39c12')
+            else:
+                messagebox.showwarning(
+                    "Couldn't Check for Updates",
+                    f"You are running version {APP_VERSION}.\n\n"
+                    "The update check failed, so it's not known whether a newer "
+                    f"version exists.\n\n{message}\n\n"
+                    f"You can also download the newest version yourself from:\n"
+                    f"{GITHUB_RELEASES_PAGE}")
+                if status:
+                    status.config(text="Update check failed", fg='#e74c3c')
             return
 
         notes = info.get('notes', '')
@@ -5636,7 +5745,8 @@ rm -f "$0"
             messagebox.showerror(
                 "Download Failed",
                 "The update could not be downloaded.\n\n"
-                "Check this computer's internet connection and try again.")
+                + (getattr(self, '_download_error', '') or
+                   "Check this computer's internet connection and try again."))
             if getattr(self, 'status_label', None):
                 self.status_label.config(text="Update download failed", fg='#e74c3c')
             return
