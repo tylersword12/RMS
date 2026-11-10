@@ -41,7 +41,7 @@ from pathlib import Path
 #
 #  The tag and APP_VERSION must match (tag v1.3.0 -> "1.3.0").
 # ============================================================
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 GITHUB_OWNER = "tylersword12"
 GITHUB_REPO = "RMS"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/"
@@ -272,6 +272,69 @@ def get_offline_service_orders_dir():
                                 ".repair_management_suite", "service_orders_offline")
         os.makedirs(fallback, exist_ok=True)
         return fallback
+
+
+PHOTO_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+PHOTOS_FOLDER = "Photos"
+
+
+def photo_folder_key(record_id, estimate_number):
+    """Folder name for a job's photos. Uses the record id so photos stay with
+    the job even if its estimate number is ever changed."""
+    key = str(record_id or '').strip() or str(estimate_number or '').strip() or 'unlinked'
+    return "".join(ch for ch in key if ch.isalnum() or ch in ('-', '_')) or 'unlinked'
+
+
+def list_photo_files(folders):
+    """{file name: full path} for photos in the given folders. Earlier folders
+    win when the same file is in more than one (shared before local)."""
+    found = {}
+    for folder in folders:
+        if not folder or not os.path.isdir(folder):
+            continue
+        try:
+            names = os.listdir(folder)
+        except Exception:
+            continue
+        for name in names:
+            if name.lower().endswith(PHOTO_EXTENSIONS) and name not in found:
+                path = os.path.join(folder, name)
+                if os.path.isfile(path):
+                    found[name] = path
+    return found
+
+
+def push_offline_photos(service_orders_dir):
+    """Upload photos taken while the share was down, then drop the local
+    copy once the upload is confirmed. Returns (uploaded, failures)."""
+    if not service_orders_dir:
+        return 0, []
+    try:
+        local_root = os.path.join(get_offline_service_orders_dir(), PHOTOS_FOLDER)
+    except Exception:
+        return 0, []
+    if not os.path.isdir(local_root):
+        return 0, []
+    shared_root = os.path.join(service_orders_dir, PHOTOS_FOLDER)
+    uploaded, failed = 0, []
+    for key in os.listdir(local_root):
+        local_dir = os.path.join(local_root, key)
+        if not os.path.isdir(local_dir):
+            continue
+        for name, local_path in list_photo_files([local_dir]).items():
+            target = os.path.join(shared_root, key, name)
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if not os.path.exists(target):
+                    shutil.copy2(local_path, target)
+                if os.path.getsize(target) == os.path.getsize(local_path):
+                    os.remove(local_path)
+                    uploaded += 1
+            except Exception as e:
+                failed.append(f"photo {name}: {e}")
+                if not os.path.isdir(service_orders_dir):
+                    return uploaded, failed     # share went away again
+    return uploaded, failed
 
 
 def read_service_order_stamp(path):
@@ -774,6 +837,26 @@ class NameAutocomplete:
         self.listbox = None
 
 
+INVOICED_FILTER_CHOICES = ['', 'Invoiced', 'Not Invoiced']
+
+
+def invoiced_display(machine, long=False):
+    """'Yes 11/10/2026' / 'No' for the tables; 'Invoiced 11/10/2026' /
+    'Not Invoiced' for the customer view."""
+    if machine.get('invoiced'):
+        date = str(machine.get('invoiced_date', '') or '')
+        return (f"Invoiced {date}" if long else f"Yes {date}").strip()
+    return "Not Invoiced" if long else "No"
+
+
+def filter_by_invoiced(machines, choice):
+    if choice == 'Invoiced':
+        return [m for m in machines if m.get('invoiced')]
+    if choice == 'Not Invoiced':
+        return [m for m in machines if not m.get('invoiced')]
+    return machines
+
+
 MAX_LABOR_RATES = 10
 # Used until rates are set up, so new service orders price the same as before
 DEFAULT_LABOR_RATES = [{'name': 'Standard', 'rate': '150.00'}]
@@ -929,6 +1012,7 @@ class MachineRepairApp:
         # Upload any service orders that were saved while offline last time
         try:
             pushed, _ = push_offline_service_orders(self.service_orders_dir)
+            push_offline_photos(self.service_orders_dir)
             if pushed and self.status_label:
                 self.status_label.config(
                     text=f"✅ Uploaded {pushed} service order(s) saved offline",
@@ -1037,6 +1121,10 @@ class MachineRepairApp:
                     self.company_name = settings.get('company_name', '')
                     self.price_list_folder = settings.get('price_list_folder', '')
                     self.column_mappings = settings.get('column_mappings', {})
+                    try:
+                        self.photo_camera_index = int(settings.get('photo_camera_index', 0) or 0)
+                    except (TypeError, ValueError):
+                        self.photo_camera_index = 0
                     if 'labor_rates' in settings:
                         self.labor_rates = clean_labor_rates(settings.get('labor_rates'))
                         self.labor_rates_updated = str(settings.get('labor_rates_updated', '') or '')
@@ -1052,6 +1140,7 @@ class MachineRepairApp:
             'company_name': self.company_name,
             'price_list_folder': self.price_list_folder,
             'column_mappings': self.column_mappings,
+            'photo_camera_index': getattr(self, 'photo_camera_index', 0),
             # Local copy of the shared labor rates, used when the share is offline
             'labor_rates': self.labor_rates,
             'labor_rates_updated': self.labor_rates_updated,
@@ -1279,6 +1368,9 @@ class MachineRepairApp:
                         pushed, _ = push_offline_service_orders(self.service_orders_dir)
                         if pushed:
                             print(f"Uploaded {pushed} offline service order(s)")
+                        photos_up, _ = push_offline_photos(self.service_orders_dir)
+                        if photos_up:
+                            print(f"Uploaded {photos_up} offline photo(s)")
                     except Exception as e:
                         print(f"Offline service order sync failed: {e}")
                     if self.save_data():
@@ -2483,14 +2575,27 @@ class MachineRepairApp:
         self.active_status_filter.pack(side='left', padx=10)
         self.active_status_filter.bind('<<ComboboxSelected>>', lambda e: self.refresh_active_table())
         
+        # Second row, so the filters fit without running off the window
+        filter_frame = tk.Frame(self.active_frame, bg='#ecf0f1')
+        filter_frame.pack(fill='x', padx=10, pady=(0, 5))
+        
         # Field / Shop filter
-        tk.Label(filter_frame, text="    Field/Shop:", bg='#ecf0f1',
+        tk.Label(filter_frame, text="Field/Shop:", bg='#ecf0f1',
                 font=('Arial', 10, 'bold')).pack(side='left')
         
         self.active_location_filter = ttk.Combobox(filter_frame, width=12, state='readonly')
         self.active_location_filter['values'] = ['', 'Field', 'Shop']
         self.active_location_filter.pack(side='left', padx=10)
         self.active_location_filter.bind('<<ComboboxSelected>>',
+                                        lambda e: self.refresh_active_table())
+        
+        # Invoiced filter
+        tk.Label(filter_frame, text="    Invoiced:", bg='#ecf0f1',
+                font=('Arial', 10, 'bold')).pack(side='left')
+        self.active_invoiced_filter = ttk.Combobox(filter_frame, width=13, state='readonly')
+        self.active_invoiced_filter['values'] = INVOICED_FILTER_CHOICES
+        self.active_invoiced_filter.pack(side='left', padx=10)
+        self.active_invoiced_filter.bind('<<ComboboxSelected>>',
                                         lambda e: self.refresh_active_table())
         
         # Clear filters button
@@ -2503,7 +2608,7 @@ class MachineRepairApp:
         
         # Table
         self.active_tree = ttk.Treeview(table_frame, columns=('estimate', 'customer', 'location', 'arrival', 
-                                       'serial', 'make', 'model', 'est_sent', 'est_complete', 'parts_ord', 'po_recv', 'po_num', 'repair_done', 'pdf'), show='headings')
+                                       'serial', 'make', 'model', 'est_sent', 'est_complete', 'parts_ord', 'po_recv', 'po_num', 'repair_done', 'invoiced', 'pdf'), show='headings')
         
         # Column headings
         self.active_tree.heading('estimate', text='Estimate #')
@@ -2520,6 +2625,8 @@ class MachineRepairApp:
         self.active_tree.heading('po_recv', text='P.O. Recv\'d')
         self.active_tree.heading('po_num', text='P.O. Number')
         self.active_tree.heading('repair_done', text='Repair Done')
+        self.active_tree.heading('invoiced', text='Invoiced ⇅',
+                                command=lambda: self.sort_tree_by_column(self.active_tree, 'invoiced'))
         self.active_tree.heading('pdf', text='PDF')
         
         # Column widths
@@ -2536,6 +2643,7 @@ class MachineRepairApp:
         self.active_tree.column('po_recv', width=65)
         self.active_tree.column('po_num', width=90)
         self.active_tree.column('repair_done', width=75)
+        self.active_tree.column('invoiced', width=115, anchor='center')
         self.active_tree.column('pdf', width=40)
         
         # Scrollbars
@@ -2582,6 +2690,15 @@ class MachineRepairApp:
         self.shipped_location_filter.bind('<<ComboboxSelected>>',
                                          lambda e: self.refresh_shipped_table())
         
+        # Invoiced filter
+        tk.Label(filter_frame, text="    Invoiced:", bg='#ecf0f1',
+                font=('Arial', 10, 'bold')).pack(side='left')
+        self.shipped_invoiced_filter = ttk.Combobox(filter_frame, width=13, state='readonly')
+        self.shipped_invoiced_filter['values'] = INVOICED_FILTER_CHOICES
+        self.shipped_invoiced_filter.pack(side='left', padx=10)
+        self.shipped_invoiced_filter.bind('<<ComboboxSelected>>',
+                                         lambda e: self.refresh_shipped_table())
+        
         tk.Button(filter_frame, text="Clear Filters", command=self.clear_shipped_filters,
                  bg='#95a5a6', fg='white', font=('Arial', 9, 'bold')).pack(side='left', padx=5)
         
@@ -2591,7 +2708,7 @@ class MachineRepairApp:
         
         # Table
         self.shipped_tree = ttk.Treeview(table_frame2, columns=('estimate', 'customer', 'location', 'arrival',
-                                        'ship_date', 'serial', 'make', 'model', 'po_num', 'pdf'), show='headings')
+                                        'ship_date', 'serial', 'make', 'model', 'po_num', 'invoiced', 'pdf'), show='headings')
         
         # Column headings
         self.shipped_tree.heading('estimate', text='Estimate #')
@@ -2604,12 +2721,15 @@ class MachineRepairApp:
         self.shipped_tree.heading('make', text='Make')
         self.shipped_tree.heading('model', text='Model')
         self.shipped_tree.heading('po_num', text='P.O. Number')
+        self.shipped_tree.heading('invoiced', text='Invoiced ⇅',
+                                 command=lambda: self.sort_tree_by_column(self.shipped_tree, 'invoiced'))
         self.shipped_tree.heading('pdf', text='PDF')
         
         # Column widths
         for col in ('estimate', 'customer', 'arrival', 'ship_date', 'serial', 'make', 'model', 'po_num'):
             self.shipped_tree.column(col, width=100)
         self.shipped_tree.column('location', width=80, anchor='center')
+        self.shipped_tree.column('invoiced', width=115, anchor='center')
         self.shipped_tree.column('pdf', width=50)
         
         # Scrollbars
@@ -2935,6 +3055,45 @@ class MachineRepairApp:
         except Exception as e:
             messagebox.showerror("Error", f"Could not change service location: {e}")
 
+    def find_live_record(self, record_id='', estimate=''):
+        """The current record for a job. A save can swap in fresh record
+        objects, so windows holding an old reference look it up again."""
+        everything = list(self.active_machines) + list(self.shipped_machines)
+        if record_id:
+            for m in everything:
+                if str(m.get('record_id', '') or '') == str(record_id):
+                    return m
+        if estimate:
+            for m in everything:
+                if m.get('estimate_number') == estimate:
+                    return m
+        return None
+
+    def set_invoiced(self, machine, invoiced):
+        """Mark a job invoiced (with today's date) or not invoiced."""
+        machine['invoiced'] = bool(invoiced)
+        machine['invoiced_date'] = datetime.now().strftime('%m/%d/%Y') if invoiced else ''
+        est = machine.get('estimate_number', '')
+        self.save_data()
+        self.refresh_tables()
+        for win in list(getattr(self, '_service_order_windows', []) or []):
+            try:
+                win.refresh_invoiced_from_log()
+            except Exception:
+                pass
+        if self.status_label:
+            self.status_label.config(
+                text=f"{est} marked invoiced" if invoiced else f"{est} marked not invoiced",
+                fg='#27ae60')
+
+    def toggle_invoiced(self, machine_idx, shipped=False):
+        try:
+            records = self.shipped_machines if shipped else self.active_machines
+            m = records[machine_idx]
+            self.set_invoiced(m, not m.get('invoiced', False))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not change invoiced status: {e}")
+
     def refresh_tables(self):
         """Refresh all tables"""
         self.refresh_active_table()
@@ -2994,6 +3153,9 @@ class MachineRepairApp:
             machines = [m for m in machines
                         if m.get('service_location', 'Shop') == loc_filter]
         
+        machines = filter_by_invoiced(
+            machines, self.active_invoiced_filter.get() if getattr(self, 'active_invoiced_filter', None) else '')
+        
         # Add machines to table
         for machine in machines:
             row_tags = ('needsinfo',) if self.needs_machine_info(machine) else ()
@@ -3011,6 +3173,7 @@ class MachineRepairApp:
                 'Yes' if machine['po_received'] else 'No',
                 machine.get('po_number', ''),
                 'Yes' if machine.get('repair_complete', False) else 'No',
+                invoiced_display(machine),
                 '📎' if machine.get('pdf_attachment') else ''
             ))
     
@@ -3022,6 +3185,8 @@ class MachineRepairApp:
             self.active_status_filter.set('')
         if self.active_location_filter:
             self.active_location_filter.set('')
+        if getattr(self, 'active_invoiced_filter', None):
+            self.active_invoiced_filter.set('')
         self.refresh_active_table()
     
     def clear_shipped_filters(self):
@@ -3030,6 +3195,8 @@ class MachineRepairApp:
             self.shipped_customer_filter.set('')
         if self.shipped_location_filter:
             self.shipped_location_filter.set('')
+        if getattr(self, 'shipped_invoiced_filter', None):
+            self.shipped_invoiced_filter.set('')
         self.refresh_shipped_table()
 
     def sort_tree_by_column(self, tree, col):
@@ -3041,7 +3208,19 @@ class MachineRepairApp:
             reverse = self._tree_sort_state.get(key, False)
 
             rows = [(tree.set(item, col), item) for item in tree.get_children('')]
-            rows.sort(key=lambda r: str(r[0]).lower(), reverse=reverse)
+            if col == 'invoiced':
+                # Not invoiced first, then invoiced oldest -> newest by real date
+                def inv_key(r):
+                    text = str(r[0])
+                    if not text.startswith('Yes'):
+                        return (0, '')
+                    try:
+                        return (1, datetime.strptime(text[3:].strip(), '%m/%d/%Y').strftime('%Y%m%d'))
+                    except ValueError:
+                        return (1, '')
+                rows.sort(key=inv_key, reverse=reverse)
+            else:
+                rows.sort(key=lambda r: str(r[0]).lower(), reverse=reverse)
             for index, (_val, item) in enumerate(rows):
                 tree.move(item, '', index)
 
@@ -3070,6 +3249,9 @@ class MachineRepairApp:
             machines = [m for m in machines
                         if m.get('service_location', 'Shop') == loc_filter]
         
+        machines = filter_by_invoiced(
+            machines, self.shipped_invoiced_filter.get() if getattr(self, 'shipped_invoiced_filter', None) else '')
+        
         # Add machines to table
         for machine in machines:
             row_tags = ('needsinfo',) if self.needs_machine_info(machine) else ()
@@ -3083,6 +3265,7 @@ class MachineRepairApp:
                 machine['make'],
                 machine['model'],
                 machine.get('po_number', ''),
+                invoiced_display(machine),
                 '📎' if machine.get('pdf_attachment') else ''
             ))
     
@@ -3205,6 +3388,11 @@ class MachineRepairApp:
         repair_text = "Remove Repair Complete" if self.active_machines[machine_idx].get('repair_complete', False) else "Mark Repair Complete"
         context_menu.add_command(label=repair_text, command=lambda: self.toggle_repair_complete(machine_idx))
         
+        inv_text = ("Remove Invoiced" if self.active_machines[machine_idx].get('invoiced')
+                    else "💲 Mark Invoiced")
+        context_menu.add_command(label=inv_text,
+                                command=lambda: self.toggle_invoiced(machine_idx))
+        
         context_menu.add_separator()
         context_menu.add_command(label="Ship Machine", command=lambda: self.ship_machine(machine_idx))
         
@@ -3277,6 +3465,11 @@ class MachineRepairApp:
         context_menu.add_command(
             label=f"Change to {other_loc}  (now: {cur_loc})",
             command=lambda: self.set_service_location(machine_idx, other_loc, shipped=True))
+        
+        inv_text = ("Remove Invoiced" if self.shipped_machines[machine_idx].get('invoiced')
+                    else "💲 Mark Invoiced")
+        context_menu.add_command(label=inv_text,
+                                command=lambda: self.toggle_invoiced(machine_idx, shipped=True))
         
         # Add PDF options
         if self.shipped_machines[machine_idx].get('pdf_attachment'):
@@ -3644,7 +3837,7 @@ class MachineRepairApp:
                 details += f"• {machine['estimate_number']} - {machine['make']} {machine['model']}\n"
                 details += f"  Serial: {machine['serial_number']} | Arrival: {machine['arrival_date']}\n"
                 details += f"  {est_sent} | {est_complete} | {parts_ord} | {po_status}\n"
-                details += f"  {repair_done}{pdf_status}\n\n"
+                details += f"  {repair_done} | {invoiced_display(machine, long=True)}{pdf_status}\n\n"
         
         if shipped:
             details += f"\nPAST REPAIRS ({len(shipped)}):\n"
@@ -3653,7 +3846,8 @@ class MachineRepairApp:
                 po_text = f" | P.O.: {machine['po_number']}" if machine.get('po_number') else ""
                 pdf_status = " | PDF: Yes" if machine.get('pdf_attachment') else ""
                 details += f"• {machine['estimate_number']} - {machine['make']} {machine['model']}\n"
-                details += f"  Serial: {machine['serial_number']} | Shipped: {machine.get('ship_date', 'N/A')}{po_text}{pdf_status}\n\n"
+                details += (f"  Serial: {machine['serial_number']} | Shipped: {machine.get('ship_date', 'N/A')}{po_text}{pdf_status}\n"
+                            f"  {invoiced_display(machine, long=True)}\n\n")
         
         if not active and not shipped:
             details += "No repairs found for this customer."
@@ -6167,6 +6361,17 @@ class ServiceOrderWindow:
                                        fg='#ecf0f1', bg='#1a252f')
         self.so_status_label.pack(side='left', pady=2)
         
+        # Invoiced - saved straight to the repair log, no Save needed
+        self.invoiced_var = tk.BooleanVar(master=self.root, value=False)
+        self.invoiced_date_label = tk.Label(so_status_frame, text="", font=('Arial', 10),
+                                            fg='#2ecc71', bg='#1a252f')
+        self.invoiced_date_label.pack(side='right', padx=(0, 10))
+        tk.Checkbutton(so_status_frame, text="💲 Invoiced", variable=self.invoiced_var,
+                       command=self._on_invoiced_toggled, font=('Arial', 12, 'bold'),
+                       fg='#2ecc71', bg='#1a252f', selectcolor='#2c3e50',
+                       activebackground='#1a252f', activeforeground='#2ecc71',
+                       cursor='hand2').pack(side='right', padx=10, pady=2)
+        
         # Main form area
         form_frame = tk.Frame(self.scrollable_frame, bg='#1a252f')
         form_frame.pack(fill='both', expand=True, padx=10, pady=5)
@@ -6505,6 +6710,25 @@ class ServiceOrderWindow:
         # New orders start on the first configured rate
         self.select_default_labor_rate()
 
+        # === PHOTOS ===
+        photos_section = tk.LabelFrame(form_frame, text="  Photos  ", font=('Arial', 11, 'bold'),
+                                       fg='#3498db', bg='#2c3e50', bd=2)
+        photos_section.pack(fill='x', pady=5)
+        photo_bar = tk.Frame(photos_section, bg='#2c3e50')
+        photo_bar.pack(fill='x', padx=10, pady=(8, 4))
+        tk.Button(photo_bar, text="📷 Take Photo", command=self.take_photo,
+                  bg='#2980b9', fg='white', font=('Arial', 12, 'bold'),
+                  padx=14, pady=6, cursor='hand2').pack(side='left')
+        tk.Button(photo_bar, text="🖼 Add From File", command=self.add_photos_from_files,
+                  bg='#7f8c8d', fg='white', font=('Arial', 10, 'bold'),
+                  padx=10, pady=6, cursor='hand2').pack(side='left', padx=8)
+        self.photo_count_label = tk.Label(photo_bar, text="", font=('Arial', 10),
+                                          fg='#bdc3c7', bg='#2c3e50')
+        self.photo_count_label.pack(side='left', padx=8)
+        self.photo_grid = tk.Frame(photos_section, bg='#2c3e50')
+        self.photo_grid.pack(fill='x', padx=10, pady=(0, 8))
+        self._photo_thumbs = []      # keep references so Tk doesn't drop the images
+        
         # === SIGNATURE SECTION ===
         sig_section = tk.Frame(form_frame, bg='#2c3e50', relief='ridge', bd=2)
         sig_section.pack(fill='x', pady=5)
@@ -7708,6 +7932,8 @@ class ServiceOrderWindow:
         
         # Check if there's an existing service order for this machine
         self.load_existing_service_order()
+        self.refresh_invoiced_from_log()
+        self.refresh_photos()
     
     def get_service_order_path(self):
         """Path for this service order on the shared drive.
@@ -7812,6 +8038,13 @@ class ServiceOrderWindow:
     def sync_offline_service_orders(self, silent=True):
         """Upload any locally cached service orders now that the share is up."""
         uploaded, failed = push_offline_service_orders(self.service_orders_dir)
+        try:
+            photos_up, photo_fail = push_offline_photos(self.service_orders_dir)
+            if photos_up:
+                print(f"Uploaded {photos_up} photo(s) taken offline")
+            failed = list(failed) + list(photo_fail)
+        except Exception as e:
+            print(f"Offline photo upload failed: {e}")
         if uploaded:
             print(f"Synced {uploaded} offline service order(s)")
             if not silent:
@@ -8061,6 +8294,383 @@ class ServiceOrderWindow:
         except Exception as e:
             print(f"Error updating repair log: {e}")
     
+    # ------------------------------------------------------------------
+    #  Invoiced
+    # ------------------------------------------------------------------
+
+    def _live_record(self):
+        return self.parent_app.find_live_record(getattr(self, 'record_id', ''),
+                                                self.linked_estimate_number)
+
+    def refresh_invoiced_from_log(self):
+        """Show the job's invoiced status from the repair log."""
+        rec = self._live_record()
+        on = bool(rec and rec.get('invoiced'))
+        self.invoiced_var.set(on)
+        date = str(rec.get('invoiced_date', '') or '') if rec else ''
+        self.invoiced_date_label.config(text=f"on {date}" if on and date else "")
+
+    def _on_invoiced_toggled(self):
+        rec = self._live_record()
+        if not rec:
+            self.invoiced_var.set(False)
+            messagebox.showwarning("Not Linked",
+                                   "This service order isn't linked to a job in the repair log.",
+                                   parent=self.window)
+            return
+        self.parent_app.set_invoiced(rec, self.invoiced_var.get())
+        self.refresh_invoiced_from_log()
+
+    # ------------------------------------------------------------------
+    #  Photos
+    # ------------------------------------------------------------------
+    # Stored as image files in <Service_Orders>/Photos/<job id>/ on the
+    # shared folder, or in this computer's offline folder when the share is
+    # down (uploaded later with the offline service orders). The folder
+    # itself is the list - no Save needed after taking a photo.
+
+    def _photo_key(self):
+        return photo_folder_key(getattr(self, 'record_id', ''), self.linked_estimate_number)
+
+    def _shared_photo_dir(self):
+        if not self.service_orders_dir:
+            return None
+        return os.path.join(self.service_orders_dir, PHOTOS_FOLDER, self._photo_key())
+
+    def _local_photo_dir(self):
+        return os.path.join(get_offline_service_orders_dir(), PHOTOS_FOLDER, self._photo_key())
+
+    def list_photos(self):
+        """Full paths of this job's photos, oldest first."""
+        if not self.linked_estimate_number:
+            return []
+        found = list_photo_files([self._shared_photo_dir(), self._local_photo_dir()])
+        return [found[name] for name in sorted(found)]
+
+    def _new_photo_name(self, ext='.jpg'):
+        safe_est = "".join(ch for ch in str(self.linked_estimate_number)
+                           if ch.isalnum() or ch in ('-', '_')) or 'photo'
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        existing = set(os.path.basename(p) for p in self.list_photos())
+        n = 1
+        while f"{safe_est}_{stamp}_{n}{ext}" in existing:
+            n += 1
+        return f"{safe_est}_{stamp}_{n}{ext}"
+
+    def _store_photo_bytes(self, data, ext='.jpg'):
+        """Write a photo to the share, or to this computer if the share is
+        down. Returns (path, 'shared'|'local')."""
+        name = self._new_photo_name(ext)
+        shared = self._shared_photo_dir()
+        if shared:
+            try:
+                os.makedirs(shared, exist_ok=True)
+                path = os.path.join(shared, name)
+                with open(path, 'wb') as f:
+                    f.write(data)
+                return path, 'shared'
+            except Exception as e:
+                print(f"Photo save to shared folder failed, keeping it locally: {e}")
+        local = self._local_photo_dir()
+        os.makedirs(local, exist_ok=True)
+        path = os.path.join(local, name)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path, 'local'
+
+    def _require_linked(self):
+        if not self.linked_estimate_number:
+            messagebox.showwarning("Warning", "Please select a machine from the repair log first.",
+                                   parent=self.window)
+            return False
+        return True
+
+    def add_photos_from_files(self):
+        if not self._require_linked():
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self.window, title="Add Photos",
+            filetypes=[("Photos", "*.jpg *.jpeg *.png *.JPG *.JPEG *.PNG"), ("All files", "*.*")])
+        added, skipped, local = 0, [], 0
+        for src in paths or []:
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in PHOTO_EXTENSIONS:
+                skipped.append(os.path.basename(src))
+                continue
+            try:
+                with open(src, 'rb') as f:
+                    data = f.read()
+                _path, where = self._store_photo_bytes(data, '.jpg' if ext == '.jpeg' else ext)
+                added += 1
+                local += (where == 'local')
+            except Exception as e:
+                skipped.append(f"{os.path.basename(src)} ({e})")
+        self.refresh_photos()
+        if skipped:
+            messagebox.showwarning("Some Photos Not Added",
+                                   "Only JPG and PNG photos can be added. Not added:\n\n"
+                                   + "\n".join(skipped[:10]), parent=self.window)
+        if local:
+            self._set_so_status(f"OFFLINE - {local} photo(s) kept on this computer; "
+                                "they'll upload when the connection is back", '#e67e22')
+
+    def refresh_photos(self):
+        """Rebuild the thumbnail strip."""
+        for w in self.photo_grid.winfo_children():
+            w.destroy()
+        self._photo_thumbs = []
+        photos = self.list_photos()
+        self.photo_count_label.config(
+            text=f"{len(photos)} photo{'s' if len(photos) != 1 else ''}" if photos
+            else "No photos yet")
+        if not photos:
+            return
+        try:
+            from PIL import Image as PILImage, ImageTk, ImageOps
+        except Exception as e:
+            tk.Label(self.photo_grid, text=f"Thumbnails unavailable ({e})", fg='#e67e22',
+                     bg='#2c3e50').pack(anchor='w')
+            return
+        per_row = 6
+        for i, path in enumerate(photos):
+            cell = tk.Frame(self.photo_grid, bg='#34495e', padx=3, pady=3)
+            cell.grid(row=i // per_row, column=i % per_row, padx=4, pady=4, sticky='n')
+            try:
+                with PILImage.open(path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    im.thumbnail((140, 140))
+                    thumb = ImageTk.PhotoImage(im.convert('RGB'), master=self.window)
+                self._photo_thumbs.append(thumb)
+                pic = tk.Label(cell, image=thumb, bg='#34495e', cursor='hand2')
+            except Exception:
+                pic = tk.Label(cell, text="(can't preview)", width=18, height=6,
+                               fg='#bdc3c7', bg='#34495e', cursor='hand2')
+            pic.pack()
+            pic.bind('<Button-1>', lambda e, p=path: self._open_file_externally(p))
+            row = tk.Frame(cell, bg='#34495e')
+            row.pack(fill='x')
+            tk.Label(row, text=f"#{i + 1}", font=('Arial', 8), fg='#bdc3c7',
+                     bg='#34495e').pack(side='left')
+            tk.Button(row, text="✕ Remove", font=('Arial', 8), bg='#c0392b', fg='white',
+                      command=lambda p=path: self.remove_photo(p),
+                      cursor='hand2').pack(side='right')
+
+    def remove_photo(self, path):
+        name = os.path.basename(path)
+        if not messagebox.askyesno("Remove Photo",
+                                   f"Remove this photo from the service order?\n\n{name}\n\n"
+                                   "It is moved to a 'removed' folder, not deleted.",
+                                   parent=self.window):
+            return
+        problems = []
+        for folder in (self._shared_photo_dir(), self._local_photo_dir()):
+            if not folder:
+                continue
+            src = os.path.join(folder, name)
+            if not os.path.exists(src):
+                continue
+            try:
+                bin_dir = os.path.join(folder, 'removed')
+                os.makedirs(bin_dir, exist_ok=True)
+                dst = os.path.join(bin_dir, name)
+                if os.path.exists(dst):
+                    base, ext = os.path.splitext(name)
+                    dst = os.path.join(bin_dir, f"{base}_{datetime.now().strftime('%H%M%S')}{ext}")
+                os.replace(src, dst)
+            except Exception as e:
+                problems.append(str(e))
+        self.refresh_photos()
+        if problems:
+            messagebox.showerror("Remove Photo", "Couldn't remove the photo:\n\n"
+                                 + "\n".join(problems), parent=self.window)
+
+    def take_photo(self):
+        """Live camera window: capture as many photos as needed."""
+        if not self._require_linked():
+            return
+        if not WEBCAM_AVAILABLE:
+            messagebox.showerror(
+                "Camera Not Available",
+                "The camera needs OpenCV, which isn't available in this copy of the "
+                "program.\n\nYou can take photos with the Windows Camera app and use "
+                "'Add From File' instead.", parent=self.window)
+            return
+        try:
+            from PIL import Image as PILImage, ImageTk
+        except Exception as e:
+            messagebox.showerror("Camera Not Available", f"Image support is missing: {e}",
+                                 parent=self.window)
+            return
+
+        state = {'cap': None, 'index': int(getattr(self.parent_app, 'photo_camera_index', 0) or 0),
+                 'running': True, 'frame': None, 'count': 0, 'tkimg': None, 'local': 0}
+
+        def open_camera(index):
+            if state['cap'] is not None:
+                try:
+                    state['cap'].release()
+                except Exception:
+                    pass
+            cap = cv2.VideoCapture(index)
+            if not cap.isOpened():
+                cap.release()
+                return None
+            # Ask for a sharp image; the camera picks the closest it supports
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            return cap
+
+        cap = open_camera(state['index'])
+        if cap is None and state['index'] != 0:
+            state['index'] = 0
+            cap = open_camera(0)
+        if cap is None:
+            messagebox.showerror(
+                "Camera Error",
+                "Couldn't open the camera.\n\nMake sure no other program (such as the "
+                "Camera app or a video call) is using it, and that camera access is "
+                "allowed in Windows Settings > Privacy > Camera.\n\n"
+                "You can also use 'Add From File'.", parent=self.window)
+            return
+        state['cap'] = cap
+
+        win = tk.Toplevel(self.window)
+        win.title(f"Take Photo - {self.linked_estimate_number}")
+        win.configure(bg='#1a252f')
+        win.transient(self.window)
+        try:
+            win.state('zoomed')            # full screen on a tablet
+        except tk.TclError:
+            win.geometry("1000x760")
+
+        top = tk.Frame(win, bg='#1a252f')
+        top.pack(fill='x', padx=12, pady=(10, 4))
+        tk.Label(top, text=f"📷 {self.linked_estimate_number}", font=('Arial', 14, 'bold'),
+                 fg='white', bg='#1a252f').pack(side='left')
+        status = tk.Label(top, text="Ready", font=('Arial', 12, 'bold'),
+                          fg='#3498db', bg='#1a252f')
+        status.pack(side='right')
+
+        video = tk.Label(win, bg='black')
+        video.pack(fill='both', expand=True, padx=12, pady=6)
+
+        btns = tk.Frame(win, bg='#1a252f')
+        btns.pack(fill='x', padx=12, pady=(4, 14))
+
+        def capture(event=None):
+            frame = state['frame']
+            if frame is None:
+                status.config(text="Camera not ready yet", fg='#e67e22')
+                return
+            try:
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if not ok:
+                    raise RuntimeError("could not encode the image")
+                _path, where = self._store_photo_bytes(buf.tobytes(), '.jpg')
+                state['count'] += 1
+                state['local'] += (where == 'local')
+                note = "" if where == 'shared' else "  (offline - kept on this computer)"
+                status.config(text=f"✔ Photo {state['count']} saved{note}",
+                              fg='#2ecc71' if where == 'shared' else '#e67e22')
+                video.config(bg='white')                    # quick flash
+                win.after(120, lambda: video.config(bg='black'))
+            except Exception as e:
+                status.config(text=f"Couldn't save photo: {e}", fg='#e74c3c')
+
+        def switch_camera():
+            for step in range(1, 5):                        # try the next few cameras
+                nxt = (state['index'] + step) % 5
+                new_cap = open_camera(nxt)
+                if new_cap is not None:
+                    state['cap'], state['index'] = new_cap, nxt
+                    state['frame'] = None
+                    status.config(text=f"Camera {nxt + 1}", fg='#3498db')
+                    return
+            state['cap'] = open_camera(state['index'])
+            status.config(text="No other camera found", fg='#e67e22')
+
+        def close(event=None):
+            state['running'] = False
+            try:
+                state['cap'].release()
+            except Exception:
+                pass
+            self.parent_app.photo_camera_index = state['index']
+            try:
+                self.parent_app.save_settings()
+            except Exception:
+                pass
+            win.destroy()
+            self.refresh_photos()
+            if state['local']:
+                self._set_so_status(f"OFFLINE - {state['local']} photo(s) kept on this "
+                                    "computer; they'll upload when the connection is back",
+                                    '#e67e22')
+
+        tk.Button(btns, text="📸  Capture", command=capture, bg='#27ae60', fg='white',
+                  font=('Arial', 18, 'bold'), padx=30, pady=10,
+                  cursor='hand2').pack(side='left', expand=True, fill='x', padx=6)
+        tk.Button(btns, text="🔄 Switch Camera", command=switch_camera, bg='#2980b9',
+                  fg='white', font=('Arial', 14, 'bold'), padx=16, pady=10,
+                  cursor='hand2').pack(side='left', padx=6)
+        tk.Button(btns, text="✔ Done", command=close, bg='#7f8c8d', fg='white',
+                  font=('Arial', 14, 'bold'), padx=24, pady=10,
+                  cursor='hand2').pack(side='left', padx=6)
+        win.bind('<space>', capture)
+        win.bind('<Return>', capture)
+        win.bind('<Escape>', close)
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        def show_frame():
+            if not state['running']:
+                return
+            try:
+                ok, frame = state['cap'].read()
+                if ok and frame is not None:
+                    state['frame'] = frame
+                    avail_w = max(video.winfo_width(), 320)
+                    avail_h = max(video.winfo_height(), 240)
+                    h, w = frame.shape[:2]
+                    scale = min(avail_w / w, avail_h / h)
+                    preview = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
+                    rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+                    state['tkimg'] = ImageTk.PhotoImage(PILImage.fromarray(rgb), master=win)
+                    video.config(image=state['tkimg'])
+            except Exception as e:
+                status.config(text=f"Camera error: {e}", fg='#e74c3c')
+            win.after(33, show_frame)
+
+        win.focus_set()
+        show_frame()
+
+    def _prepared_photos(self, max_px=1600):
+        """Photos ready for a PDF: [(ImageReader, width_px, height_px, caption)].
+        Rotated upright and scaled down so the PDF stays a sensible size."""
+        out = []
+        photos = self.list_photos()
+        if not photos:
+            return out
+        try:
+            from PIL import Image as PILImage, ImageOps
+            from reportlab.lib.utils import ImageReader
+        except Exception as e:
+            print(f"Photos left out of PDF: {e}")
+            return out
+        for i, path in enumerate(photos, start=1):
+            try:
+                with PILImage.open(path) as im:
+                    im = ImageOps.exif_transpose(im).convert('RGB')
+                    im.thumbnail((max_px, max_px))
+                    buf = BytesIO()
+                    im.save(buf, 'JPEG', quality=85)
+                    buf.seek(0)
+                    w, h = im.size
+                taken = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%m/%d/%Y %I:%M %p')
+                out.append((ImageReader(buf), w, h, f"Photo {i}  -  {taken}"))
+            except Exception as e:
+                print(f"Skipping photo {path}: {e}")
+        return out
+
     def export_to_pdf(self):
         """Export service order to PDF"""
         if not REPORTLAB_AVAILABLE:
@@ -8252,6 +8862,23 @@ class ServiceOrderWindow:
                         py2 = sig_box_top - 5 - y2 * scale
                         c.line(px1, py1, px2, py2)
             
+            # Photos, two per page, after the order
+            photos = self._prepared_photos()
+            per_page_h = (height - 110 - 50) / 2 - 24
+            for i, (reader, pw, ph, caption) in enumerate(photos):
+                if i % 2 == 0:
+                    c.showPage()
+                    c.setFont("Helvetica-Bold", 14)
+                    c.drawString(50, height - 50,
+                                 f"Photos - Order #{self.order_number_var.get() or self.linked_estimate_number}")
+                    py = height - 80
+                scale = min((width - 100) / pw, per_page_h / ph)
+                dw, dh = pw * scale, ph * scale
+                c.drawImage(reader, 50 + (width - 100 - dw) / 2, py - dh, dw, dh)
+                c.setFont("Helvetica", 9)
+                c.drawCentredString(width / 2, py - dh - 12, caption)
+                py -= dh + 30
+            
             c.save()
             messagebox.showinfo("Exported", f"Service order exported to:\n{filename}")
             
@@ -8336,6 +8963,15 @@ class ServiceOrderWindow:
                        selectcolor='#1a252f', activebackground='#2c3e50',
                        activeforeground='white', font=('Arial', 10),
                        anchor='w').pack(fill='x', pady=2)
+        photo_count = len(self.list_photos())
+        include_photos = tk.BooleanVar(master=dlg, value=photo_count > 0)
+        tk.Checkbutton(opts_frame,
+                       text=(f"Include photos ({photo_count})" if photo_count
+                             else "Include photos (none taken)"),
+                       variable=include_photos, bg='#2c3e50', fg='white',
+                       selectcolor='#1a252f', activebackground='#2c3e50',
+                       activeforeground='white', font=('Arial', 10), anchor='w',
+                       state='normal' if photo_count else 'disabled').pack(fill='x', pady=2)
 
         tk.Label(dlg, text="Uncheck pricing for a work-completed record with no dollar amounts.",
                  font=('Arial', 8, 'italic'), fg='#95a5a6', bg='#2c3e50',
@@ -8383,6 +9019,7 @@ class ServiceOrderWindow:
             result['pricing'] = include_pricing.get()
             result['parts'] = include_parts.get()
             result['reason'] = include_reason.get()
+            result['photos'] = include_photos.get() and photo_count > 0
             result['send_email'] = send_email.get()
             result['email'] = addr
             dlg.destroy()
@@ -8728,6 +9365,10 @@ class ServiceOrderWindow:
     def _render_customer_copy_pdf(self, filename, opts):
         """Render the customer copy. Two passes so footers can say 'Page X of Y'."""
         import io
+
+        # Prepare photos once; both passes draw the same images
+        opts = dict(opts)
+        opts['_photos'] = self._prepared_photos() if opts.get('photos') else []
 
         # Pass 1: render to memory purely to count pages
         buf = io.BytesIO()
@@ -9233,6 +9874,28 @@ class ServiceOrderWindow:
         c.drawString(LEFT + 300, state['y'] - 4,
                      f"Date: {self.sig_date_var.get()}")
 
+        # ---- photos, two to a page, after the signatures ----
+        photos = opts.get('_photos') or []
+        if photos:
+            new_page()
+            section(f"PHOTOS ({len(photos)})")
+            max_h = (TOP - 60 - BOTTOM) / 2 - 24      # two per page
+            for reader, pw, ph, caption in photos:
+                scale = min(CONTENT_W / pw, max_h / ph)
+                dw, dh = pw * scale, ph * scale
+                need(dh + 26)
+                x = LEFT + (CONTENT_W - dw) / 2
+                c.drawImage(reader, x, state['y'] - dh, dw, dh)
+                c.setLineWidth(0.5)
+                c.setStrokeColorRGB(0.75, 0.75, 0.75)
+                c.rect(x, state['y'] - dh, dw, dh, stroke=1, fill=0)
+                c.setStrokeColorRGB(0, 0, 0)
+                c.setFont("Helvetica", 8.5)
+                c.setFillColorRGB(0.35, 0.35, 0.35)
+                c.drawCentredString((LEFT + RIGHT) / 2, state['y'] - dh - 12, caption)
+                c.setFillColorRGB(0, 0, 0)
+                state['y'] -= dh + 26
+
         draw_footer()
         c.save()
         return state['page']
@@ -9389,7 +10052,15 @@ class ServiceOrderWindow:
         """Clear all form fields"""
         if messagebox.askyesno("Clear Form", "Are you sure you want to clear all fields?"):
             self.linked_estimate_number = None
+            self.record_id = ''
             self.linked_label.config(text="No machine selected")
+            # Photos and invoiced belong to the job, which is now unlinked
+            try:
+                self.refresh_photos()
+                self.invoiced_var.set(False)
+                self.invoiced_date_label.config(text="")
+            except Exception:
+                pass
             
             # Clear all StringVars
             for var in [self.estimate_date_var, self.repair_date_var, self.po_number_var,

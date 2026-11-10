@@ -3,7 +3,7 @@
 Windows desktop app for tracking machine repairs, service orders and customer
 sign-off, built for field and shop technicians.
 
-**Current version: 1.3.6**
+**Current version: 1.3.7**
 
 ## What it does
 
@@ -11,6 +11,11 @@ sign-off, built for field and shop technicians.
 - Service orders with parts lookup, labor, totals and on-screen customer signature
 - Up to 10 named labor rates (Settings > Labor Rates in a service order),
   shared by every computer and picked from a dropdown
+- Mark any job invoiced (right-click, or the Invoiced box on its service order);
+  sort and filter both repair lists by invoiced / not invoiced
+- Take photos with the tablet camera, or add photo files, inside a service order;
+  photos are stored in the shared Service_Orders\Photos folder and can be
+  included in the PDFs
 - **Customer copy PDF** of completed work, with the signature rendered on it
 - Opens an **Outlook draft** with that PDF attached, addressed to the customer
 - Brother label printing and barcode / webcam scanning
