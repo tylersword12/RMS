@@ -6558,26 +6558,26 @@ class ServiceOrderWindow:
         tk.Label(parts_section, text="PARTS", font=('Arial', 12, 'bold'),
                 fg='#3498db', bg='#2c3e50').pack(anchor='w', padx=10, pady=5)
         
-        # Parts header - using grid for precise alignment
-        parts_header = tk.Frame(parts_section, bg='#34495e')
-        parts_header.pack(fill='x', padx=10)
+        # Header and all part rows share ONE grid, so every heading sits
+        # exactly over its column. (Separate frames per row only lined up by
+        # luck, and the bold header font made each heading wider than its
+        # column, so Qty / Each / Total drifted right.)
+        parts_grid = tk.Frame(parts_section, bg='#2c3e50')
+        parts_grid.pack(anchor='w', padx=10, pady=(0, 4))
         
-        tk.Label(parts_header, text="Part #", font=('Arial', 10, 'bold'), width=16,
-                fg='white', bg='#34495e', anchor='w').grid(row=0, column=0, padx=1)
-        tk.Label(parts_header, text="Description", font=('Arial', 10, 'bold'), width=35,
-                fg='white', bg='#34495e', anchor='w').grid(row=0, column=1, padx=1)
-        tk.Label(parts_header, text="Qty", font=('Arial', 10, 'bold'), width=8,
-                fg='white', bg='#34495e', anchor='w').grid(row=0, column=2, padx=1)
-        tk.Label(parts_header, text="Each $", font=('Arial', 10, 'bold'), width=10,
-                fg='white', bg='#34495e', anchor='w').grid(row=0, column=3, padx=1)
-        tk.Label(parts_header, text="Total $", font=('Arial', 10, 'bold'), width=10,
-                fg='white', bg='#34495e', anchor='w').grid(row=0, column=4, padx=1)
+        for col, (text, anchor) in enumerate((("Part #", 'w'), ("Description", 'w'),
+                                              ("Qty", 'center'), ("Each $", 'center'),
+                                              ("Total $", 'center'))):
+            # width=1 so the heading never widens the column; the boxes set it
+            tk.Label(parts_grid, text=text, font=('Arial', 10, 'bold'), width=1,
+                     fg='white', bg='#34495e', anchor=anchor, padx=4
+                     ).grid(row=0, column=col, padx=1, pady=(0, 2), sticky='ew')
         
-        # Parts rows (14 rows like the Excel) - using grid
+        # Parts rows (14 rows like the Excel)
         self.parts_entries = []
         for i in range(14):
-            row_frame = tk.Frame(parts_section, bg='#2c3e50')
-            row_frame.pack(fill='x', padx=10, pady=1)
+            row_frame = parts_grid        # same grid as the headings
+            r = i + 1
             
             part_num = tk.StringVar(master=self.root)
             desc = tk.StringVar(master=self.root)
@@ -6587,20 +6587,20 @@ class ServiceOrderWindow:
             
             # Part number entry with autocomplete
             part_entry = tk.Entry(row_frame, textvariable=part_num, width=16, font=('Arial', 9))
-            part_entry.grid(row=0, column=0, padx=1)
+            part_entry.grid(row=r, column=0, padx=1, pady=1, sticky='ew')
             
             desc_entry = tk.Entry(row_frame, textvariable=desc, width=35, font=('Arial', 9))
-            desc_entry.grid(row=0, column=1, padx=1)
+            desc_entry.grid(row=r, column=1, padx=1, pady=1, sticky='ew')
             
             qty_entry = tk.Entry(row_frame, textvariable=qty, width=8, font=('Arial', 9))
-            qty_entry.grid(row=0, column=2, padx=1)
+            qty_entry.grid(row=r, column=2, padx=1, pady=1, sticky='ew')
             
             each_entry = tk.Entry(row_frame, textvariable=each, width=10, font=('Arial', 9))
-            each_entry.grid(row=0, column=3, padx=1)
+            each_entry.grid(row=r, column=3, padx=1, pady=1, sticky='ew')
             
             total_label = tk.Label(row_frame, textvariable=total, width=10, font=('Arial', 9),
                                   bg='#ecf0f1', relief='sunken', anchor='e')
-            total_label.grid(row=0, column=4, padx=1)
+            total_label.grid(row=r, column=4, padx=1, pady=1, sticky='ew')
             
             # Bind autocomplete to part number entry
             self.setup_part_autocomplete(part_entry, part_num, desc, each)
